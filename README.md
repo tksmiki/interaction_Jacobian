@@ -1,3 +1,6 @@
-# interaction_Jacobian
+## interaction_Jacobian
 
-## Rnotebook html version is available here.
+### Files for reproducing our results are available here.
+
+
+### The following file would be a conceptual summary diagram for our study
