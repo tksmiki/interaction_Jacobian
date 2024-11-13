@@ -1,7 +1,7 @@
 ## How to quantify interaction strengths? A critical rethinking of the interaction Jacobian and evaluation methods for non-parametric inference in time series analysis
 <b>Authorship</b>: Takeshi Miki, Chun-Wei Chang, Po-Ju Ke, Arndt Telschow, Cheng-Han Tsai, Masayuki Ushio, Chih-hao Hsieh
 
-### Files for reproducing our results are available here
+### R codes and related files for reproducing our results are available here
 You can start with "ode_edm2024v3.nb_20241028.html", which is the html version of the rendered Rnotebok including the excuted results and graphics. If you would like to excute the codes by yourself, you can use the Rnotebook "ode_edm2024v3.Rmd". Since some analyses (e.g. MDR S-map) need substantial computational time, you can also load some parts of results from the R object files with the extension ".obj" and skip such analyses. 
 
 ### A conceptual summary diagram for our study is also available
