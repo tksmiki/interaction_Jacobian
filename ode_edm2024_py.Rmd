@@ -1,0 +1,695 @@
+---
+title: "Python Notebook for S-map for DE and ODE models"
+output: html_notebook
+---
+
+### [0] Setting Python environment (in RStudio)
+Download Python environment: https://www.python.org/downloads/
+
+#### [0.1] Loading the package for Python environment
+```{r}
+library(reticulate)
+```
+
+#### [0.2] Installing libraries & Loading classes
+In R chunk
+```{r}
+library_name = "pandas"
+if (py_module_available(library_name)) {
+  message(paste("The library", library_name, "is already installed."))
+} else {
+  message(paste("The library", library_name, "is not installed. Installing now..."))
+  py_install(library_name)
+}
+
+library_name = "matplotlib"
+if (py_module_available(library_name)) {
+  message(paste("The library", library_name, "is already installed."))
+} else {
+  message(paste("The library", library_name, "is not installed. Installing now..."))
+  py_install(library_name)
+}
+
+library_name = "pyEDM"
+if (py_module_available(library_name)) {
+  message(paste("The library", library_name, "is already installed."))
+} else {
+  message(paste("The library", library_name, "is not installed. Installing now..."))
+  py_install(library_name)
+}
+```
+
+In Python chunk
+```{python}
+import numpy as np   #for numerical calculations
+import pandas as pd
+import math    #for mathematical functions
+import pyEDM   #for EDM analysis
+import matplotlib.pyplot as plt   #for graphics
+import multiprocessing as mp #for paralell computing
+from numpy import exp
+```
+
+### [1] General functions for ODEs
+4th-order explicit Runge-Kutta method with a fixed interval function
+
+```{python}
+def rk4(in_vec, out_vec, time, h_interval, dim, diff_vec, ref_data = None):
+    #in_vec: the vector with the value at "time"
+    #out_vec: the vector with which the updated vector value after one time step is saved
+    #time: time value
+    #h_interval: time step for discritizing ODE
+    #dim: dimension of the ODE
+    #diff_vec: function that determines the r.h.s. of the ODE
+
+    k1 = np.zeros([dim])
+    k2 = np.zeros([dim])
+    k3 = np.zeros([dim])
+    k4 = np.zeros([dim])
+
+    temp_vec = np.zeros([dim])
+    h_half = h_interval / 2.0
+    t_h = time + h_half
+
+    k1 = diff_vec(in_vec, time, h_interval, dim, ref_data)  # calculate k1
+    temp_vec = in_vec + h_half * k1
+    k2 = diff_vec(temp_vec, t_h, h_interval, dim, ref_data)  # calculate k2
+    temp_vec = in_vec + h_half * k2
+    k3 = diff_vec(temp_vec, t_h, h_interval, dim, ref_data)  # calculate k3
+    temp_vec = in_vec + h_interval * k3
+    k4 = diff_vec(temp_vec, time + h_interval, h_interval, dim, ref_data)  # calculate k4
+
+    for i in range(0, dim):
+      out_vec[i] = in_vec[i] + (h_interval / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
+```
+### [2] Model01 setting
+Interaction strength estimation for time-discrete model (DE) framework
+
+#### [2.1] Model equations
+2-Host 2-Parasitoid System with natural mortality (i.e., with overlapping generations)
+
+Note: When the natural mortality goes to infinity, the model converges to 2-Host 2-Parasitoid Nicolson-Baily Model
+
+\[
+H_{k,t+1} = H_{k,t} + r_k exp[-a_{k}H_{k,t} - c_{1k} P_{1,t} - c_{2k} P_{2, t}] H_{k,t} - (1 - exp[-a_{k}H_{k,t} - c_{1k} P_{1,t} - c_{2k} P_{2,t}  - m_{H,k}]) H_{k,t}  \quad (k=1,2) \tag{D1}
+\]
+It is set as 
+\[
+H_{k,t+1} = H_{k,t} + F_{Hk}(H_{1,t}, H_{2,t}, P_{1,t}, P_{2,t})
+\]
+
+\[
+P_{j,t+1} = P_{j,t} + \sum_{k=1,2} exp(-a_k H_{k,t}) (1 -  exp[-c_{1k} P_{1,t} - c_{2k} P_{2,t}]) \frac{c_{jk} P_{j,t}}{c_{1k} P_{1,t} + c_{2k} P_{2,t}} H_{k,t} -(1 - exp(-m_{P,j})) P_{j,t} \quad (j=1,2) \tag{D2}
+\]
+It is set as 
+\[
+P_{j,t+1} = P_{j,t} + F_{Pj}(H_{1,t}, H_{2,t}, P_{1,t}, P_{2,t})
+\]
+
+
+#### [2.2] Parameters and settings for the 4-species coupled host-parasitoid model
+
+##### [2.2.1] Parameter value setting
+```{python}
+r1 = 2.0
+r2 = 2.0
+a1 = 0.1
+a2 = 0.1
+c11 = 0.3 #P1 -> H1
+c21 = 0.1 #P2 -> H1
+c12 = 0.1 #P1 -> H2
+c22 = 0.3 #P2 -> H2
+mH1 = 0.1
+mH2 = 0.1
+mP1 = 0.1
+mP2 = 0.1
+```
+##### [2.2.2] Setting for numerical calculations
+```{python}
+j_Host1 = 0
+j_Host2 = 1
+j_Paras1 = 2
+j_Paras2 = 3
+```
+##### [2.2.3] Functions specific to 4-sp model
+Note that FH1, FH2, FP1, FP2, are defined as the changes of the abundance (X_t+1 - X_t)
+```{python}
+def FH1(in_vec, t):
+  term1 = r1*exp(-a1 * in_vec[j_Host1] - c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2]) * in_vec[j_Host1]
+  term2 = (1.0 - exp(-a1 * in_vec[j_Host1] - c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2] - mH1)) * in_vec[j_Host1]
+  return term1 - term2
+
+def FH2(in_vec, t):
+  term1 = r2*exp(-a2 * in_vec[j_Host2] - c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2]) * in_vec[j_Host2]
+  term2 = (1.0 - exp(-a2 * in_vec[j_Host2] - c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2] - mH2)) * in_vec[j_Host2]
+  return term1 - term2
+
+def FP1(in_vec, t):
+  term1 = exp(-a1 * in_vec[j_Host1]) * (1 - exp(-c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2])) * c11 * in_vec[j_Paras1] / (c11 * in_vec[j_Paras1] + c21 * in_vec[j_Paras2]) * in_vec[j_Host1]
+  
+  term2 = exp(-a2 * in_vec[j_Host2]) * (1 - exp(-c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2])) * c12 * in_vec[j_Paras1] / (c12 * in_vec[j_Paras1] + c22 * in_vec[j_Paras2]) * in_vec[j_Host2]
+  
+  term3 = (1.0 - exp(-mP1)) * in_vec[j_Paras1]
+  return term1 + term2 - term3
+
+  
+def FP2(in_vec, t):
+  term1 = exp(-a1 * in_vec[j_Host1]) * (1 - exp(-c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2])) * c21 * in_vec[j_Paras2] / (c11 * in_vec[j_Paras1] + c21 * in_vec[j_Paras2]) * in_vec[j_Host1]
+  
+  term2 = exp(-a2 * in_vec[j_Host2]) * (1 - exp(-c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2])) * c22 * in_vec[j_Paras2] / (c12 * in_vec[j_Paras1] + c22 * in_vec[j_Paras2]) * in_vec[j_Host2]
+  
+  term3 = (1.0 - exp(-mP2)) * in_vec[j_Paras2]
+  return term1 + term2 - term3
+
+#function to calculate all changes four dimensional
+def diff_4HP(in_vec, t, dim):
+  temp_vec = np.zeros([dim])
+  temp_vec[j_Host1] = FH1(in_vec, t)
+  temp_vec[j_Host2] = FH2(in_vec, t)
+  temp_vec[j_Paras1] = FP1(in_vec, t)
+  temp_vec[j_Paras2] = FP2(in_vec, t)
+  return temp_vec
+
+```
+##### [2.2.4] Initial setting and conditions
+```{python}
+dim_model2 = 4
+nv_4HP0 = np.zeros([dim_model2])
+nv_4HP = np.zeros([dim_model2])
+
+nv_4HP0[j_Host1] = 1.0
+nv_4HP0[j_Host2] = 1.0
+nv_4HP0[j_Paras1] = 0.1
+nv_4HP0[j_Paras2] = 0.1
+```
+#### [2.3] Solving the model
+##### [2.3.2] Trial with two pairs of Host - Parasitoid system
+Running the model
+```{python}
+t = 0  # initial condition (initial time, 0)
+end_time = 2000
+
+HP_result = np.zeros([end_time + 1, dim_model2 + 1]) #array for saving the time series generated
+
+#Setting initial condition; it is important to start with asymmetric densities to reach quickly the chaotic attractor
+nv_4HP[j_Host1] = 1.0
+nv_4HP[j_Host2] = 0.5
+nv_4HP[j_Paras1] = 0.1
+nv_4HP[j_Paras2] = 0.2
+
+#record initial condition
+HP_result[0, 1:] = nv_4HP
+
+#For the transient dynamics 
+for i in range (1, (end_time + 1)): 
+  nv_4HP = nv_4HP + diff_4HP(nv_4HP, t, dim_model2)
+  t = t + 1 #update time
+  HP_result[i, 0] = t
+  HP_result[i, 1:] = nv_4HP
+
+print(HP_result)
+```
+Plotting the time series
+```{python}
+plt.clf() #clear the figure setting
+plt.xlim([0, end_time])
+plt.ylim([0, 5])
+plt.plot(HP_result[:, 0], HP_result[:, j_Host1 + 1], color = "black", label = "H1", linestyle = "solid", linewidth = 0.5)
+plt.plot(HP_result[:, 0], HP_result[:, j_Host2 + 1], color = "black", label = "H2", linestyle = "dashed", linewidth = 0.5)
+plt.plot(HP_result[:, 0], HP_result[:, j_Paras1 + 1], color = "red", label = "P1", linestyle = "solid", linewidth = 0.5)
+plt.plot(HP_result[:, 0], HP_result[:, j_Paras2 + 1], color = "red", label = "P2", linestyle = "dashed", linewidth = 0.5)
+
+plt.xlabel('time step t')
+plt.ylabel('H1, H2, P1, P2')
+plt.legend()
+plt.show()
+
+```
+Converting the array to dataframe for pyEDM
+```{python}
+HP_result_df = pd.DataFrame(HP_result, columns = ["time", "H1", "H2", "P1", "P2"])
+print(HP_result_df)
+```
+
+### [3] A simple analysis with multivariate S-map
+Based on https://ushio-ecology-blog.blogspot.com/2019/12/20191225blogger0007.html
+
+#### [3.1] Analysis with standardization
+Subset of the final part of the generated time series
+```{python}
+HP_result_df = HP_result_df.loc[1800:1999]
+print(HP_result_df)
+```
+
+##### [3.1.1] Standardization
+```{python}
+HP_result_mean = HP_result_df.iloc[:, 1:].mean(axis = 0, skipna = True)  # mean abundance
+HP_result_sd = HP_result_df.iloc[:, 1:].std(axis = 0, skipna = True)      # SD of abundance 
+print(HP_result_mean)
+print(HP_result_sd)
+
+HP_result_s = (HP_result_df.iloc[:, 1:] - HP_result_mean) / HP_result_sd # Standardized data set
+#add the first column as time
+HP_result_s.insert(0, "time", HP_result_df.iloc[:, 0])
+print(HP_result_s)
+```
+
+##### [3.1.2] Analysis with the standardized time series data 
+- Conducting univariate smap for obtaining the optimal theta
+
+- But do not use the result, because R version determined the optimal theta by the minimum rmse while pyEDM's function returns the correlation coefficient rho only.
+```{python}
+result_optimal_theta_H1 = pyEDM.PredictNonlinear(dataFrame = HP_result_s, columns = "H1", target = "H1",  lib = [1, 200], pred = [1, 200], E = 4)
+print(result_optimal_theta_H1)
+```
+
+Conducting multivariate Smap with the optimal theta (= 8, based on the result from rEDM)
+
+- Note that time index for the coefficient is different from the outcome of rEDM
+```{python}
+multivariate_Smap_HP = pyEDM.SMap(dataFrame = HP_result_s, columns = ["H1", "H2", "P1", "P2"], target = "H1", lib = [1, 200], pred = [1, 200], theta = 8, verbose = False, showPlot = False, embedded = True)
+type(multivariate_Smap_HP['coefficients'])
+print(multivariate_Smap_HP['coefficients'])
+```
+
+##### [3.1.3] Plotting the results
+We can see that the adjustment of the diagonal elements makes the intraspecific interaction strengths comparable to the iterspecific interaction strengths. 
+```{python}
+Smap_HP_coeffcients = multivariate_Smap_HP['coefficients']
+delta_11 = 1 #adjustment for the diagonal elements
+
+plt.clf() #clear the figure setting
+plt.xlim([1800, 2000])
+plt.ylim([-0.6, 1.6])
+plt.plot(Smap_HP_coeffcients["Time"][1:], Smap_HP_coeffcients["∂H1/∂H1"][1:], color = "black", label = "H1toH1", linestyle = "solid", linewidth = 1.0, marker = "o", fillstyle = 'none')
+plt.plot(Smap_HP_coeffcients["Time"][1:], Smap_HP_coeffcients["∂H1/∂H1"][1:] - delta_11, color = "#ff4b00", label = "H1toH1_adjusted", linestyle = "solid", linewidth = 1.0, marker = "s")
+plt.plot(Smap_HP_coeffcients["Time"][1:], Smap_HP_coeffcients["∂H1/∂H2"][1:], color = "#4dc4ff", label = "H2toH1", linestyle = "solid", linewidth = 1.0, marker = "o")
+plt.plot(Smap_HP_coeffcients["Time"][1:], Smap_HP_coeffcients["∂H1/∂P1"][1:], color = "#f6aa00", label = "P1toH1", linestyle = "solid", linewidth = 1.0, marker = "^")
+plt.plot(Smap_HP_coeffcients["Time"][1:], Smap_HP_coeffcients["∂H1/∂P2"][1:], color = "#804000", label = "P2toH1", linestyle = "solid", linewidth = 1.0, marker = "D", fillstyle = 'none')
+
+
+plt.xlabel('time step t')
+plt.ylabel('Unadjusted and adjusted S-map coefficients')
+plt.title('Figure 1: Time evolution of S-map coefficients')
+plt.legend(loc = "upper center", bbox_to_anchor = (0.5, 1.0), ncol = 3)
+plt.show()
+```
+### [5] Model02 setting
+#### [5.1] Model equations for the 5-species coupled food chain ODE model
+\[
+\frac{dP_i}{dt} = v_i \lambda_i \frac{P_i C_i}{C_i + C_i^*} - v_i P_i, \quad (i=1,2) \tag{1}
+\]
+
+\[
+\frac{dC_i}{dt} = \mu_i \kappa_i \frac{C_i R}{R + R^*} - v_i \lambda_i \frac{P_i C_i}{C_i + C_i^*} - \mu_i C_i, \quad (i=1,2) \tag{2}
+\]
+
+\[
+\frac{dR}{dt} = R \left( 1 - \frac{R}{k} \right) - \sum_{i=1,2} \mu_i \kappa_i \frac{C_iR}{R + R^*}.\tag{3}
+\]
+
+#### [5.2] Parameters and settings for the 5-species coupled food chain ODE model
+##### [5.2.1] Parameter value setting
+```{python}
+v1 = 0.1
+v2 = 0.07
+lambd1 = 3.2
+lambd2 = 2.9
+Cstar1 = 0.5
+Cstar2 = 0.5
+myu1 = 0.15
+myu2 = 0.15
+kp1 = 2.5
+kp2 = 2.0
+Rstar = 0.3
+k = 1.2
+```
+##### [5.2.2] Settings for numerically solving ODEs
+```{python}
+j_P1 = 0
+j_P2 = 1
+j_C1 = 2
+j_C2 = 3
+j_R = 4
+```
+##### [5.2.3] Functions specific to the 5-sp model
+```{python}
+def dP1dt(in_vec, t):
+  growth = v1 * lambd1 * in_vec[j_P1] * in_vec[j_C1] / (in_vec[j_C1] + Cstar1)
+  mortality =  v1 * in_vec[j_P1]
+  return growth - mortality 
+
+def dP2dt(in_vec, t):
+  growth = v2 * lambd2 * in_vec[j_P2] * in_vec[j_C2] / (in_vec[j_C2] + Cstar2)
+  mortality = v2 * in_vec[j_P2]
+  return growth - mortality 
+
+def dC1dt(in_vec, t):
+  growth = myu1 * kp1 * in_vec[j_C1] * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  mortality = v1 * lambd1 * in_vec[j_P1] * in_vec[j_C1] / (in_vec[j_C1] + Cstar1) + myu1 * in_vec[j_C1]
+  return growth - mortality 
+
+def dC2dt(in_vec, t):
+  growth = myu2 * kp2 * in_vec[j_C2] * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  mortality  = v2 * lambd2 * in_vec[j_P2] * in_vec[j_C2] / (in_vec[j_C2] + Cstar2) + myu2 * in_vec[j_C2]
+  return growth - mortality
+
+def dRdt(in_vec, t):
+  growth = in_vec[j_R] * (1.0 - in_vec[j_R] / k)
+  mortality = myu1 * kp1 * in_vec[j_C1] * in_vec[j_R] / (in_vec[j_R] + Rstar) + myu2 * kp2 * in_vec[j_C2] * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  return growth - mortality
+
+#function to calculate all coefficients, five dimensional
+def diff_5sp(in_vec, t, h_interval, dim, ref_data = None):
+  temp_vec = np.zeros([dim])
+  temp_vec[j_P1] = dP1dt(in_vec, t)
+  temp_vec[j_P2] = dP2dt(in_vec, t)
+  temp_vec[j_C1] = dC1dt(in_vec, t)
+  temp_vec[j_C2] = dC2dt(in_vec, t)
+  temp_vec[j_R] = dRdt(in_vec, t)
+  return temp_vec
+```
+##### [5.2.4] Initial setting and conditions
+```{python}
+dim_model1 = 5
+nv = np.zeros([dim_model1])
+deltat = 0.01
+```
+
+#### [5.3] Solving the model
+##### [5.3.1] Solving the model by the RK4 method
+```{python}
+t = 0.0  # initial condition (initial time, 0)
+end_time = 2000
+tau = 5
+transient_period = 1000
+write_index = 1
+
+no_step = int((end_time - transient_period) / tau) + 1
+rk4_result = np.zeros([no_step, dim_model1 + 1]) #array for saving the time series generated
+
+#Initial condition set
+nv[j_R] = 1.0
+nv[j_C1] = 0.5
+nv[j_C2] = 0.8
+nv[j_P1] = 0.7
+nv[j_P2] = 0.8
+print(nv)
+
+#For the transient dynamics (RUN BURN)
+for i in range(1, int(transient_period / deltat) + 1):
+  rk4(in_vec = nv, out_vec = nv, time = t, h_interval = deltat, dim = dim_model1, diff_vec = diff_5sp)
+  t = t + deltat # update time
+
+#record the initial condition after BURNING phase
+rk4_result[0, 0] = t
+rk4_result[0, 1:] = nv
+
+#After transient period
+j = 0
+for i in range(1, int((end_time - transient_period) / deltat) + 1):
+  rk4(in_vec = nv, out_vec = nv, time = t, h_interval = deltat, dim = dim_model1, diff_vec = diff_5sp)
+  t = t + deltat # update time
+  ###record the result every "tau only
+  if write_index < int(tau / deltat):
+    write_index += 1
+  else:
+    write_index =  1
+    j += 1
+    rk4_result[j, 0] = t
+    rk4_result[j, 1:] = nv
+print(rk4_result)
+```
+
+```{python}
+rk4_result_df = pd.DataFrame(rk4_result, columns = ["time", "P1", "P2", "C1", "C2", "R"])
+print(rk4_result_df)
+```
+
+##### [5.3.2] Basic plot for the result
+```{python}
+plt.clf() #clear the figure setting
+plt.xlim([transient_period, end_time])
+plt.ylim([0, 2])
+plt.plot(rk4_result_df["time"], rk4_result_df["C1"], color = "red", label = "C1", linestyle = "solid", linewidth = 0.5)
+plt.plot(rk4_result_df["time"], rk4_result_df["C2"], color = "blue", label = "C2", linestyle = "solid", linewidth = 0.5)
+plt.plot(rk4_result_df["time"], rk4_result_df["R"], color = "green", label = "R", linestyle = "solid", linewidth = 0.5)
+
+
+plt.xlabel('time')
+plt.ylabel('abunance')
+plt.legend()
+plt.show()
+
+```
+### [6] Theoretical coefficients evaluated by instantaneous Jacobian
+The partial derivative of dC1/dt 
+
+
+with respect to C1:
+\[
+\frac{\partial}{\partial C_{1}} \left( \mu_{1} K_{1} \frac{C_{1} R}{R + R^{*}} - v_{1} \lambda_{1} \frac{P_{1} C_{1}}{C_{1} + C_{1}^{*}} - \mu_{1} C_{1} \right) = K_{1} \mu_{1} \frac{R}{R + R^{*}} - v_{1} \lambda_{1} \frac{P_{1} C_{1}*}{(C_{1} + C_{1}^{*})^2} - \mu_{1}
+\]
+
+with respect to R:
+\[
+\frac{\partial}{\partial R} \left( \mu_{1} \kappa_{1} \frac{C_{1} R}{R + R^{*}} \right) = \kappa_{1} \mu_{1} \frac{C_{1} R^*}{(R + R^{*})^2}
+\]
+
+
+Function definition
+```{python}
+def dC1dC1(data): 
+  coeff = myu1 * kp1 * data["R"] / (data["R"] + Rstar) - v1 * lambd1 * data["P1"] * Cstar1/ (data["C1"] + Cstar1) ** 2 - myu1
+  return coeff 
+
+def dC1dR(data):
+  coeff = myu1 * kp1 * data["C1"] * Rstar / (data["R"] + Rstar) ** 2
+  return coeff 
+```
+
+
+### [7] Adjusted interaction strengths with multivariate S-map
+Based on https://ushio-ecology-blog.blogspot.com/2019/12/20191225blogger0007.html
+
+#### [7.1] Analysis with standardization
+##### [7.1.1] Standardization
+```{python}
+rk4_result_mean = rk4_result_df.iloc[:, 1:].mean(axis = 0, skipna = True)  # mean abundance
+rk4_result_sd = rk4_result_df.iloc[:, 1:].std(axis = 0, skipna = True)      # SD of abundance 
+print(rk4_result_mean)
+print(rk4_result_sd)
+
+rk4_result_s = (rk4_result_df.iloc[:, 1:] - rk4_result_mean) / rk4_result_sd # Standardized data set
+#add the first column as time
+rk4_result_s.insert(0, "time", rk4_result_df.iloc[:, 0])
+print(rk4_result_s)
+```
+
+##### [7.1.2] Analaysis with the standardized time series data 
+
+Conducting multivariate Smap with the optimal theta (= 8, based on the result from rEDM)
+```{python}
+multivariate_Smap_5sp = pyEDM.SMap(dataFrame = rk4_result_s, columns = ["P1", "P2", "C1", "C2", "R"], target = "C1", lib = [1, 201], pred = [1, 201], theta = 8, verbose = False, showPlot = False, embedded = True)
+print(multivariate_Smap_5sp['coefficients'])
+```
+
+
+#### [7.2] Compare standard S-map and instantaneous interaction strengths (IIS)
+```{python}
+Smap_5sp_coeffcients = multivariate_Smap_5sp['coefficients']
+delta_C1C1 = 1 #adjustment for the diagonal elements
+
+plt.clf() #clear the figure setting
+plt.xlim([1000, 2000])
+plt.ylim([-1.6, 1.6])
+plt.plot(Smap_5sp_coeffcients["Time"][1:201], Smap_5sp_coeffcients["∂C1/∂C1"][2:202] - delta_C1C1, color = "black", label = "multivariate S-map", linestyle = "solid", linewidth = 0.5)
+plt.plot(Smap_5sp_coeffcients["Time"][1:201], tau*dC1dC1(rk4_result_df[1:201]), color = "blue", label = "IIS", linestyle = "solid", linewidth = 0.5)
+
+plt.xlabel('time')
+plt.ylabel('S-map coefficients: C1 -> C1')
+#plt.title('')
+plt.legend(loc = "upper center", bbox_to_anchor = (0.5, 1.0))
+plt.show()
+```
+### [8] Deriving mathematically correct interaction coefficients
+
+#### [8.2] Solving the model
+##### [8.2.1] Preparing the fine solution of the ODEs without perturbation
+Since rk4() includes the evaluation of derivatives at t + deltat/2, we need to have numerical solutions with the high resolution with deltat/2
+```{python}
+t = 0.0  # initial condition (initial time, 0)
+end_time = 2000
+tau = 5
+transient_period = 1000
+write_index = 1
+deltat_fine = deltat * 0.5
+
+no_step_fine = int((end_time - transient_period) / deltat_fine) + 1
+rk4_result_fine = np.zeros([no_step_fine, dim_model1 + 1]) #array for saving the time series generated
+
+#Initial condition set
+nv_rk4_fine = np.zeros([dim_model1])
+
+#Initial condition set
+nv_rk4_fine[j_R] = 1.0
+nv_rk4_fine[j_C1] = 0.5
+nv_rk4_fine[j_C2] = 0.8
+nv_rk4_fine[j_P1] = 0.7
+nv_rk4_fine[j_P2] = 0.8
+
+#For the transient dynamics (RUN BURN)
+for i in range(1, int(transient_period / deltat_fine) + 1):
+  rk4(in_vec = nv_rk4_fine, out_vec = nv_rk4_fine, time = t, h_interval = deltat_fine, dim = dim_model1, diff_vec = diff_5sp)
+  t = t + deltat_fine # update time
+
+#record the initial condition after BURNING phase
+rk4_result_fine[0, 0] = t
+rk4_result_fine[0, 1:] = nv_rk4_fine
+
+#After transient period, recording every time step
+j = 0
+for i in range(1, int((end_time - transient_period) / deltat_fine) + 1):
+  rk4(in_vec = nv_rk4_fine, out_vec = nv_rk4_fine, time = t, h_interval = deltat_fine, dim = dim_model1, diff_vec = diff_5sp)
+  t = t + deltat_fine # update time
+  j += 1
+  rk4_result_fine[j, 0] = t
+  rk4_result_fine[j, 1:] = nv_rk4_fine
+
+print(rk4_result_fine)
+```
+
+```{python}
+rk4_result_fine_df = pd.DataFrame(rk4_result_fine, columns = ["time", "P1", "P2", "C1", "C2", "R"])
+print(rk4_result_fine_df)
+```
+
+Comparing the solutions 
+```{python}
+
+plt.clf() #clear the figure setting
+plt.xlim([1000, 2000])
+plt.ylim([-0.1, 1.6])
+plt.plot(rk4_result_df["time"], rk4_result_df["C1"], color = "red", label = "default delta-t", linestyle = "solid", linewidth = 0.5)
+plt.plot(rk4_result_fine_df["time"], rk4_result_fine_df["C1"], color = "black", label = "half delta-t", linestyle = "solid", linewidth = 0.5)
+
+plt.xlabel('time')
+plt.ylabel('C1 abundance')
+#plt.title('')
+plt.legend(loc = "upper center", bbox_to_anchor = (0.5, 1.0))
+plt.show()
+```
+
+##### [8.2.3] Functions to calculate the interaction strength
+```{python}
+#ref_data: the dataset that includes the fine resolution solution of the target nonlinear ODE systems, of which record started at absolute time = transient_period
+#deltax: the size of perturbation at t = h_interval/2
+#start_t: usually specified as transient_period
+#tau: the interval for the calculation
+#dim: dimension of ODE system
+#diff_vec: the vector field generated by the linearized ODEs with non-perturbed solution or the original nonlinear ODE
+
+#This is a function that directly used the nonlinear ODE with the perturbed initial conditions
+def direct_coeff(ref_data, deltax, start_t, tau, h_interval, dim, diff_vec):
+  #matrix to stock results
+  nv_nonlinear_p = np.zeros([dim, dim])
+  
+  tzero = start_t - transient_period + h_interval / 2  # initial condition (initial time, t_abs = start_t)
+  t_index_start = int((tzero / h_interval) * 2) - 1
+  t_index_end = t_index_start + int((tau / h_interval) * 2)
+  
+  #Initial condition 
+  nv_nonlinear_p[:, j_P1] = ref_data.iloc[t_index_start, 1:] + [deltax, 0, 0, 0, 0]
+  nv_nonlinear_p[:, j_P2] = ref_data.iloc[t_index_start, 1:] + [0, deltax, 0, 0, 0]
+  nv_nonlinear_p[:, j_C1] = ref_data.iloc[t_index_start, 1:] + [0, 0, deltax, 0, 0]
+  nv_nonlinear_p[:, j_C2] = ref_data.iloc[t_index_start, 1:] + [0, 0, 0, deltax, 0]
+  nv_nonlinear_p[:, j_R] = ref_data.iloc[t_index_start, 1:] + [0, 0, 0, 0, deltax]    
+ 
+  end_time = tau
+  
+  for j in range(0, dim): 
+    t = tzero
+    for i in range(1, int(end_time / deltat) + 1):
+      rk4(nv_nonlinear_p[:, j], nv_nonlinear_p[:, j], t, h_interval, dim, diff_vec)
+      t = t + h_interval # update time (starting from the middle)
+  
+  #Calculate the difference between the perturbed flow and unperturbed flow
+  for j in range(0, dim):
+    nv_nonlinear_p[:, j] = nv_nonlinear_p[:, j] - ref_data.iloc[t_index_end, 1:]  
+  
+  return nv_nonlinear_p / deltax
+
+```
+
+
+##### [8.2.5] Nonlinear ODE model for calculating all points from 1000 to 2000 with interval 
+The blokc using mclapply() in R is simply replaced by for loop in python, since the computational time is not large even in a laptop Windows PC.
+```{r eval=FALSE}
+direct_coeff_5sp <- list()
+
+start_time <- vector()
+transient_period <- 1000
+
+direct_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_nonlinear <- direct_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau, deltat, dim = 5, diff_5sp)
+  result_nonlinear
+}, mc.cores = 1)
+
+direct_coeff_5sp[[5]]
+```
+Python codes and results
+```{python}
+no_step = 200
+direct_coeff_5sp = np.zeros([no_step, dim_model1, dim_model1])
+for i in range(0, no_step):
+  start_t_i = transient_period + i * tau
+  direct_coeff_5sp[i, :, :] = direct_coeff(rk4_result_fine_df, deltax = 0.0001, start_t = start_t_i, tau = 5, h_interval = deltat, dim = dim_model1, diff_vec = diff_5sp)
+  
+print(direct_coeff_5sp[4, :, :])
+```
+
+### [10] Comparisons for 5sp model
+
+#### [10.1] Compare standard S-map, IIS, and CIS by direct evaluation (but without MDR S-map)
+CIS by Direct evaluation: direct_IS (Eqn.19)
+```{python}
+#normalization by SD
+sd_adj_C1R = rk4_result_sd[j_R] / rk4_result_sd[j_C1]
+delta_C1C1 = 1
+
+direct_dC1dC1 = direct_coeff_5sp[:, j_C1, j_C1] - delta_C1C1
+direct_dC1dR = sd_adj_C1R * direct_coeff_5sp[:, j_C1, j_R]
+```
+##### [10.1.2] Comparison for the diagonal element (Fig. 3a: C1 -> C1): corresponding to ggplot in R
+```{python}
+plt.clf() #clear the figure setting
+plt.xlim([1400, 1800])
+plt.ylim([-3, 2.0])
+plt.plot(Smap_5sp_coeffcients["Time"][80:161], Smap_5sp_coeffcients["∂C1/∂C1"][81:162] - delta_C1C1, color = "#ff4b00", label = "01std_smapC1toC1", linestyle = "solid", linewidth = 0.5, marker = "s")
+plt.plot(Smap_5sp_coeffcients["Time"][80:161], direct_dC1dC1[80:161], color = "#f6aa00", label = "03CIS_dC1dC1", linestyle = "solid", linewidth = 0.5, marker = "^")
+plt.plot(Smap_5sp_coeffcients["Time"][80:161], tau*dC1dC1(rk4_result_df[80:161]), color = "#804000", label = "04IIS_dC1dC1", linestyle = "solid", linewidth = 0.5, marker = "D", fillstyle = 'none')
+
+plt.xlabel('time')
+plt.ylabel('S-map coefficients: C1 -> C1')
+plt.title('Time evolution: C1 -> C1')
+plt.legend(loc = "upper center", bbox_to_anchor = (0.5, 1.0), ncol = 3)
+plt.show()
+```
+
+##### [10.1.3] Comparison for the diagonal element (Fig. 3c:R -> C1): corresponding to ggplot in R
+```{python}
+plt.clf() #clear the figure setting
+plt.xlim([1400, 1800])
+plt.ylim([0, 9])
+plt.plot(Smap_5sp_coeffcients["Time"][80:161], Smap_5sp_coeffcients["∂C1/∂R"][81:162] - delta_C1C1, color = "#ff4b00", label = "01std_smapRtoC1", linestyle = "solid", linewidth = 0.5, marker = "s")
+plt.plot(Smap_5sp_coeffcients["Time"][80:161], direct_dC1dR[80:161], color = "#f6aa00", label = "03CIS_dC1dR", linestyle = "solid", linewidth = 0.5, marker = "^")
+plt.plot(Smap_5sp_coeffcients["Time"][80:161], tau*dC1dR(rk4_result_df[80:161]), color = "#804000", label = "04IIS_dC1dR", linestyle = "solid", linewidth = 0.5, marker = "D", fillstyle = 'none')
+
+plt.xlabel('time')
+plt.ylabel('S-map coefficients: R -> C1')
+plt.title('Time evolution: R -> C1')
+plt.legend(loc = "upper center", bbox_to_anchor = (0.5, 1.0), ncol = 3)
+plt.show()
+```
+

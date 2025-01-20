@@ -1,0 +1,1963 @@
+---
+title: "R Notebook for MDR S-map for DE and ODE models version 4"
+output: html_notebook
+---
+### [0] Packages loading
+rEDM should be the version 1.2.3
+
+https://cran.r-project.org/src/contrib/Archive/rEDM/
+
+```{r}
+library(mathjaxr)
+library(rEDM); packageVersion("rEDM")
+library(parallel)
+library(doParallel)
+library(foreach)
+library(Kendall)
+library(MASS)
+library(dplyr)
+library(glmnet)
+library(ggplot2)
+#source("../Demo_MDR_function.R")
+source("./Demo_MDR_function2.R") #from 2024/05/07
+```
+
+### [1] General functions for ODEs
+4th-order explicit Runge-Kutta method with a fixed interval function
+```{r}
+rk4 <- function(in_vec, ref_data = NULL, time, h_interval, dim, diff_vec)
+{
+  #in_vec: the vector with the value at "time"
+  #out_vec: the vector with which the updated vector value after one time step is saved
+  #time: time value
+  #h_interval: time step for discritizing ODE
+  #dim: dimension of the ODE
+  #diff_vec: function that determines the r.h.s. of the ODE
+  
+  k1 <- numeric(dim)
+  k2 <- numeric(dim)
+  k3 <- numeric(dim)
+  k4 <- numeric(dim)
+  temp_vec <- numeric(dim)
+  h_half <- h_interval / 2.0
+  t_h <- time + h_half
+  
+  k1 <- diff_vec(in_vec, ref_data, time, h_interval, dim)  # calculate k1
+  temp_vec <- in_vec + h_half * k1
+  k2 <- diff_vec(temp_vec, ref_data, t_h, h_interval, dim)  # calculate k2
+  temp_vec <- in_vec + h_half * k2
+  k3 <- diff_vec(temp_vec, ref_data, t_h, h_interval, dim)  # calculate k3
+  temp_vec <- in_vec + h_interval * k3
+  k4 <- diff_vec(temp_vec, ref_data, time + h_interval, h_interval, dim)  # calculate k4
+  
+  temp_vec <- in_vec + (h_interval / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+  temp_vec
+}
+
+```
+
+
+### [2] Model01 setting
+Interaction strength estimation for time-discrete model (DE) framework
+
+#### [2.1] Model equations
+2-Host 2-Parasitoid System with natural mortality (i.e., with overlapping generations)
+
+Note: When the natural mortality goes to infinity, the model converges to 2-Host 2-Parasitoid Nicolson-Baily Model
+
+\[
+H_{k,t+1} = H_{k,t} + r_k exp[-a_{k}H_{k,t} - c_{1k} P_{1,t} - c_{2k} P_{2, t}] H_{k,t} - (1 - exp[-a_{k}H_{k,t} - c_{1k} P_{1,t} - c_{2k} P_{2,t}  - m_{H,k}]) H_{k,t}  \quad (k=1,2) \tag{D1}
+\]
+It is set as 
+\[
+H_{k,t+1} = H_{k,t} + F_{Hk}(H_{1,t}, H_{2,t}, P_{1,t}, P_{2,t})
+\]
+
+\[
+P_{j,t+1} = P_{j,t} + \sum_{k=1,2} exp(-a_k H_{k,t}) (1 -  exp[-c_{1k} P_{1,t} - c_{2k} P_{2,t}]) \frac{c_{jk} P_{j,t}}{c_{1k} P_{1,t} + c_{2k} P_{2,t}} H_{k,t} -(1 - exp(-m_{P,j})) P_{j,t} \quad (j=1,2) \tag{D2}
+\]
+It is set as 
+\[
+P_{j,t+1} = P_{j,t} + F_{Pj}(H_{1,t}, H_{2,t}, P_{1,t}, P_{2,t})
+\]
+
+
+#### [2.2] Parameters and settings for the 4-species coupled host-parasitoid model
+##### [2.2.1] Parameter value setting
+```{r}
+r1 <- 2.0
+r2 <- 2.0
+a1 <- 0.1
+a2 <- 0.1
+c11 <- 0.3 #P1 -> H1
+c21 <- 0.1 #P2 -> H1
+c12 <- 0.1 #P1 -> H2
+c22 <- 0.3 #P2 -> H2
+mH1 <- 0.1
+mH2 <- 0.1
+mP1 <- 0.1
+mP2 <- 0.1
+```
+##### [2.2.2] Setting for numerical calculations
+```{r}
+j_Host1 <- 1
+j_Host2 <- 2
+j_Paras1 <- 3
+j_Paras2 <- 4
+```
+##### [2.2.3] Functions specific to 4-sp model
+Note that FH1, FH2, FP1, FP2, are defined as the changes of the abundance (X_t+1 - X_t)
+```{r}
+FH1 <- function(in_vec, t) {
+  term1 <- r1*exp(-a1 * in_vec[j_Host1] - c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2]) * in_vec[j_Host1]
+  term2 <- (1.0 - exp(-a1 * in_vec[j_Host1] - c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2] - mH1)) * in_vec[j_Host1]
+  return(term1 - term2)
+}
+
+FH2 <- function(in_vec, t) {
+  term1 <- r2*exp(-a2 * in_vec[j_Host2] - c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2]) * in_vec[j_Host2]
+  term2 <- (1.0 - exp(-a2 * in_vec[j_Host2] - c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2] - mH2)) * in_vec[j_Host2]
+  return(term1 - term2)
+}
+  
+FP1 <- function(in_vec, t) {
+  term1 <- exp(-a1 * in_vec[j_Host1]) * (1 - exp(-c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2])) * c11 * in_vec[j_Paras1] / (c11 * in_vec[j_Paras1] + c21 * in_vec[j_Paras2]) * in_vec[j_Host1]
+  
+  term2 <- exp(-a2 * in_vec[j_Host2]) * (1 - exp(-c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2])) * c12 * in_vec[j_Paras1] / (c12 * in_vec[j_Paras1] + c22 * in_vec[j_Paras2]) * in_vec[j_Host2]
+  
+  term3 <- (1.0 - exp(- mP1)) * in_vec[j_Paras1]
+  return(term1 + term2 - term3)
+}
+  
+FP2 <- function(in_vec, t) {
+  term1 <- exp(-a1 * in_vec[j_Host1]) * (1 - exp(-c11 * in_vec[j_Paras1] - c21 * in_vec[j_Paras2])) * c21 * in_vec[j_Paras2] / (c11 * in_vec[j_Paras1] + c21 * in_vec[j_Paras2]) * in_vec[j_Host1]
+  
+  term2 <- exp(-a2 * in_vec[j_Host2]) * (1 - exp(-c12 * in_vec[j_Paras1] - c22 * in_vec[j_Paras2])) * c22 * in_vec[j_Paras2] / (c12 * in_vec[j_Paras1] + c22 * in_vec[j_Paras2]) * in_vec[j_Host2]
+  
+  term3 <- (1.0 - exp(- mP2)) * in_vec[j_Paras2]
+  return(term1 + term2 - term3)
+}
+
+#function to calculate all changes four dimensional
+diff_4HP <- function(in_vec, t, dim){
+  temp_vec <- numeric(dim)
+  temp_vec[j_Host1] <- FH1(in_vec, t)
+  temp_vec[j_Host2] <- FH2(in_vec, t)
+  temp_vec[j_Paras1] <- FP1(in_vec, t)
+  temp_vec[j_Paras2] <- FP2(in_vec, t)
+  temp_vec
+} 
+```
+
+##### [2.2.4] Initial setting and conditions
+```{r}
+dim_model2 <- 4
+nv_4HP0 <- numeric(dim_model2)
+nv_4HP <- numeric(dim_model2)
+
+nv_4HP0[j_Host1] <- 1.0
+nv_4HP0[j_Host2] <- 1.0
+nv_4HP0[j_Paras1] <- 0.1
+nv_4HP0[j_Paras2] <- 0.1
+
+```
+#### [2.3] Solving the model
+##### [2.3.1] Trial with a single Host - single Parasitoid system
+```{r}
+t <- 0  # initial condition (initial time, 0)
+end_time <- 1000
+
+#Setting initial condition
+nv_4HP[j_Host1] <- 1.0
+nv_4HP[j_Host2] <- 0.0
+nv_4HP[j_Paras1] <- 0.1
+nv_4HP[j_Paras2] <- 0.0
+
+
+# write initial condition
+cat(t, nv_4HP, "\n")
+
+
+# record the initial condition
+HP_result <- data.frame(t = t, H1 = nv_4HP[j_Host1], H2 = nv_4HP[j_Host2], P1 = nv_4HP[j_Paras1], P2 = nv_4HP[j_Paras2])
+#For the transient dynamics (RUN BURN)
+for(i in 1:end_time){
+  nv_4HP <- nv_4HP + diff_4HP(nv_4HP, t, dim_model2)
+  t <- t + 1 #update time
+  HP_result <- rbind.data.frame(HP_result, c(t, nv_4HP[j_Host1], nv_4HP[j_Host2], nv_4HP[j_Paras1], nv_4HP[j_Paras2]))
+}
+
+head(HP_result)
+
+#Trial of the plot
+plot(HP_result$t, HP_result$H1, type = "l", ylim = c(0,20))
+par(new = T)
+plot(HP_result$t, HP_result$P1, type = "l", ylim = c(0,20), col = "red")
+```
+##### [2.3.2] Trial with two pairs of Host - Parasitoid system
+```{r}
+t <- 0  # initial condition (initial time, 0)
+end_time <- 2000
+
+#Setting initial condition; it is important to start with asymmetric densities to reach quickly the chaotic attractor
+nv_4HP[j_Host1] <- 1.0
+nv_4HP[j_Host2] <- 0.5
+nv_4HP[j_Paras1] <- 0.1
+nv_4HP[j_Paras2] <- 0.2
+
+
+# write initial condition
+cat(t, nv_4HP, "\n")
+
+
+# record the initial condition
+HP_result <- data.frame(t = t, H1 = nv_4HP[j_Host1], H2 = nv_4HP[j_Host2], P1 = nv_4HP[j_Paras1], P2 = nv_4HP[j_Paras2])
+#For the transient dynamics (RUN BURN)
+for(i in 1:end_time){
+  nv_4HP <- nv_4HP + diff_4HP(nv_4HP, t, dim_model2)
+  t <- t + 1 #update time
+  HP_result <- rbind.data.frame(HP_result, c(t, nv_4HP[j_Host1], nv_4HP[j_Host2], nv_4HP[j_Paras1], nv_4HP[j_Paras2]))
+}
+
+head(HP_result)
+
+#Trial of the plot
+plot(HP_result$t, HP_result$H1, type = "l", ylim = c(0,5))
+par(new = T)
+plot(HP_result$t, HP_result$P1, type = "l", ylim = c(0,5), col = "red")
+par(new = T)
+plot(HP_result$t, HP_result$H2, type = "l", ylim = c(0,5), lty = "dashed")
+par(new = T)
+plot(HP_result$t, HP_result$P2, type = "l", ylim = c(0,5), col = "red", lty = "dashed")
+
+DAY = Sys.Date()
+saveRDS(HP_result, paste("HP4p_result_", DAY, ".obj", sep = ""))
+```
+### [3] A simple analysis with multivariate S-map
+Based on https://ushio-ecology-blog.blogspot.com/2019/12/20191225blogger0007.html
+
+#### [3.1] Analysis with standardization
+Loading the default data at 2024-07-25 and taking the final 200 data points in the time series
+```{r}
+HP_result <- readRDS("HP4p_result_2024-07-25.obj")
+HP_result <- HP_result[1801:2000, ]
+```
+
+##### [3.1.1] Standardization
+```{r}
+HP_result.mean <- apply(HP_result[, -1], 2, mean, na.rm = T)  # mean abundance
+HP_result.sd <- apply(HP_result[, -1], 2, sd, na.rm = T)      # SD of abundance 
+
+mean_mat <- matrix(HP_result.mean, nrow = nrow(HP_result) , ncol = length(HP_result.mean), byrow = TRUE)
+sd_mat <- matrix(HP_result.sd, nrow = nrow(HP_result) , ncol = length(HP_result.mean), byrow = TRUE)
+
+HP_result_s <- (HP_result[, -1] - mean_mat) /sd_mat # Standardized data set
+head(HP_result_s)
+```
+##### [3.1.2] Analysis with the standardized time series data 
+```{r}
+# data block for smap
+HP_smap_block_s <- data.frame(H1 = HP_result_s$H1, H2 = HP_result_s$H2, P1 = HP_result_s$P1, P2 = HP_result_s$P2)
+
+# delete a few column
+# conducting univariate smap for obtaining the optimal theta
+HP_m_smap_res_s <- block_lnlp(HP_smap_block_s, method = "s-map",
+                         target_column = j_Host1, 
+                         theta = c(0, 1e-04, 3e-04, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8),
+                         silent = TRUE)
+```
+Plotting the effect of theta
+```{r}
+plot(HP_m_smap_res_s$theta, HP_m_smap_res_s$rmse, type = "b")
+(HP_opt_theta_s <- HP_m_smap_res_s$theta[which.min(HP_m_smap_res_s$rmse)])
+```
+
+Conducting multivariate smap with the optimal theta
+```{r}
+HP_m_smap_res2_s <- block_lnlp(HP_smap_block_s, method = "s-map", 
+                              target_column = j_Host1, 
+                              theta = HP_opt_theta_s, 
+                              silent = TRUE, 
+                              save_smap_coefficients = TRUE)
+head(as.data.frame(HP_m_smap_res2_s$smap_coefficients[[1]]))
+```
+##### [3.1.3] Plotting the results
+```{r}
+final_ID <- 200
+delta_11 <- 1
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11, type = "l", col = 1, ylim = c(-0.9, 1.0), xlab = "time", ylab = "Smap coefficient: X -> Host1", main = "S-map for H1")
+par(new = T)
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_2[-final_ID], type = "l", col = "red", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+par(new = T)
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID], type = "l", col = "blue", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+par(new = T)
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_4[-final_ID], type = "l", col = "green", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+
+legend("topright", 
+          legend = c("S-map from H1 to H1 - delta11", "S-map from H2 to H1", "S-map from P1 to H1", "S-map from P2 to H1"),  
+          col = c("black", "red", "blue", "green"), 
+          lty = c(1, 1, 1, 1),              
+          cex = 0.8)   
+```
+##### [3.1.4] Plotting the results for manuscript (Fig.1)
+
+```{r}
+gg_HP_result00 <- data.frame(time = HP_result$t[-final_ID], smap = HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID], type = rep("H1toH1", 199))
+gg_HP_result01 <- data.frame(time = HP_result$t[-final_ID], smap = HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11, type = rep("H1toH1_adjusted", 199))
+gg_HP_result02 <- data.frame(time = HP_result$t[-final_ID], smap = HP_m_smap_res2_s$smap_coefficients[[1]]$c_2[-final_ID], type = rep("H2toH1", 199))
+gg_HP_result03 <- data.frame(time = HP_result$t[-final_ID], smap = HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID], type = rep("P1toH1", 199))
+gg_HP_result04 <- data.frame(time = HP_result$t[-final_ID], smap = HP_m_smap_res2_s$smap_coefficients[[1]]$c_4[-final_ID], type = rep("P2toH1", 199))
+
+gg_HP_result <- rbind.data.frame(gg_HP_result00, gg_HP_result01)
+gg_HP_result <- rbind.data.frame(gg_HP_result, gg_HP_result02)
+gg_HP_result <- rbind.data.frame(gg_HP_result, gg_HP_result03)
+gg_HP_result <- rbind.data.frame(gg_HP_result, gg_HP_result04)
+
+
+fig1_ggplot <- ggplot(data = gg_HP_result) +
+  scale_colour_manual(values = c("black", "#ff4b00","#4dc4ff", "#f6aa00", "#804000")) +
+  scale_shape_manual(values = c(1, 15, 16, 17, 5)) +
+　geom_line(aes(x = time, y = smap, group = type, color = type)) +
+  geom_point(aes(x = time, y = smap, color = type, shape = type), size = 2) +
+  xlim(1800, 1999) +  ylim(-0.5, 1.5) + theme_bw() + theme(legend.position = "bottom") + 
+  labs(title = "Figure 1: Time evolution of S-map coefficients", x = "time", y = "Unadjusted and Adjusted S-map coefficients") 
+plot(fig1_ggplot)
+ggsave("fig1_ggplot.pdf", width = 10, height = 5)
+```
+
+### [4] MDR S-map for 2host-2parasitoid system
+Applying MDR S-map to the 4sp coupled host-parasitoid model
+
+#### [4.1] Data prearrangement
+Read dataset
+```{r}
+da.range <- 1801:2000 # Subsample for data analysis
+out.sample <- T # T/F for out-of-sample forecast
+nout <- 2  # number of out-of-sample
+
+da.name <- '4p_model'
+do <- readRDS("HP4p_result_2024-07-25.obj")
+dot <- do[da.range, 1] # data time
+do <- do[da.range, -1] # subset of data without t
+ndo <- nrow(do)
+nin <- ndo - nout # library sample size
+```
+Standardization
+```{r}
+# In-sample
+do.mean <- apply(do[1:nin, ], 2, mean, na.rm = T)  # mean abundance in in-sample
+do.sd <- apply(do[1:nin, ], 2, sd, na.rm = T)      # SD of abundance in in-sample
+d <- do[1:(nin-1), ]                          # In-sample dataset at time t
+d_tp1 <- do[2:(nin), ]                        # In-sample dataset at time t+1
+ds <- (d - repmat(do.mean, nrow(d), 1))*repmat(do.sd, nrow(d), 1) ^ -1 # Normalized in-sample dataset at time t
+ds_tp1 <- (d_tp1 - repmat(do.mean, nrow(d_tp1), 1))*repmat(do.sd, nrow(d_tp1), 1) ^ -1 # Normalized in-sample dataset at time t+1
+
+# Out-sample
+if(out.sample & nout != 0){
+  d.test <- do[nin:(ndo - 1), ]                 # Out-of-sample dataset at time t 
+  dt_tp1 <- do[(nin + 1): ndo, ]                 # Out-of-sample dataset at time t+1
+  ds.test <- (d.test - repmat(do.mean, nrow(d.test), 1))*repmat(do.sd, nrow(d.test), 1) ^ -1 # Normalized out-of-sample dataset at time t
+  dst_tp1 <- (dt_tp1 - repmat(do.mean, nrow(dt_tp1), 1))*repmat(do.sd, nrow(dt_tp1), 1) ^ -1 # Normalized out-of-sample dataset at time t+1
+}else{d.test <- dt_tp1 <- ds.test <- NULL}
+
+# Compiled data at time t 
+ds.all <- rbind(ds, ds.test)
+head(ds.all)
+```
+Initialization of pseudo-random number generator
+```{r}
+seed <- 49563
+set.seed(seed)
+```
+
+
+#### [4.2] Optimal embedding dimension
+Find the optimal embedding dimension, based on univariate simplex projection
+```{r warning = FALSE}
+Emax <- 4 # equal to or smaller than the number of nodes (dimension of the DE system)
+cri <- 'rmse' # model selection 
+Ed <- NULL
+forecast_skill_simplex <- NULL
+for(i in 1:ncol(ds)){
+  spx.i <- simplex(ds[, i], E = 2:Emax)
+  Ed <- c(Ed, spx.i[which.min(spx.i[, cri])[1], 'E'])
+  forecast_skill_simplex <- c(forecast_skill_simplex, spx.i[which.min(spx.i[, cri])[1], 'rho'])
+}
+Ed # The optimal embedding dimension for each variable
+```
+Optimal embedding dimension and forecasting skill
+```{r}
+Ed
+forecast_skill_simplex
+
+```
+#### [4.3] CCM analysis
+* Find causal variables by CCM analysis that will be used for multiview embedding.
+
+* Warning: It is time consuming for calculating the causation for each node
+
+* CCM causality test for all node pairs (the function was updated at 2024/05/07)
+```{r warning = FALSE}
+ccm.out <- ccm.fast.demo(ds, Epair = T, cri = cri, Emax = Emax)
+ccm.sig <- ccm.out[['ccm.sig']]
+ccm.rho <- ccm.out[['ccm.rho']]
+#To avoid overwrite the original files, we save them with different names,identified by date.
+DAY = Sys.Date()
+saveRDS(ccm.sig, paste('ccm_sig', da.name,'nin', nin, DAY, '.obj', sep = '_'))
+saveRDS(ccm.rho, paste('ccm_rho', da.name,'nin', nin, DAY, 'demo.obj', sep = '_'))
+```
+Just in case not conducting CCM but just loading the result of CCM at 2024/07/29
+```{r}
+DAY = "2024-07-29"
+ccm.sig_old <- readRDS(paste('ccm_sig', da.name,'nin', nin, DAY, '.obj', sep = '_')) 
+ccm.rho_old <- readRDS(paste('ccm_rho', da.name,'nin', nin, DAY, 'demo.obj', sep = '_'))
+```
+
+```{r}
+ccm.sig
+ccm.rho
+```
+#### [4.4] Multiview distance
+##### [4.4.1] Performing multiview analysis
+Based on the causal variables detected in CCM,
+
+(1) generates the time lag series (with maximum lag = 3),
+
+(2) conduct multivariate simplex projection and evaluate the forecast skill, and
+
+(3) selected the best kn(=100) SSR.
+
+Perform multiview embedding analysis for each node
+
+Warning: It is time consuming for running multiview embedding for each nodes
+```{r warning = FALSE}
+esele_lag <- esim.lag.demo(ds, ccm.rho, ccm.sig, Ed, kmax = 10000, kn = 100, max_lag = 3, Emax = Emax)
+# To avoid overwrite the original files, we save them with different names, 'XXX_NEW'.
+DAY = Sys.Date()
+saveRDS(esele_lag, paste('eseleLag', da.name, 'nin', nin, DAY, 'demo.obj', sep='_'))
+```
+The list of the selected best multivariate SSRs for each node (species, sp) with
+
+(1) the correlation coefficient (rho)
+
+(2) the list of variables (X_1, X_2, …) used in each SSR, noting that the number of variables is identical to the optimal embedding dimension obtained in [2.1], and
+
+(3) the list of time lags (vlag_1, vlag_2, …) used in the corresponding variables (X_1, X_2, …).
+```{r}
+as.data.frame(esele_lag)
+```
+
+##### [4.4.2] Compute multiview distance
+```{r}
+dmatrix.mv <- mvdist.demo(ds, ds.all, esele_lag)
+dmatrix.train.mvx <- dmatrix.mv[['dmatrix.train.mvx']]
+dmatrix.test.mvx <- dmatrix.mv[['dmatrix.test.mvx']]
+```
+Leave-one-out cross-validation for finding the optimal parameters for MDR S-map analysis
+
+–Warning: The cross-validation is the most time-consuming step in MDR S-map requiring massive computations and . Thus, we recommend dividing job into smaller parts (sub.da>1) or used parallel computation (parall=T, ncore>=1)
+```{r}
+do.MDR.CV <- T
+### The parameter cv.unit determines the precision of selected parameters and strongly influences computation time.
+### In our cases, we used cv.unit=0.025 to obtain more precise estimations
+### This parameter may be adjusted to 0.05 or even 0.1, depending on how sensitive the results to parameter precision. 
+cv.unit <- 0.025
+alpha.so <- seq(0, 1, cv.unit);            # Sequence of alpha
+sub.da <- 1                                # Divide the computation job into five parts 
+afsp <- eqsplit(1:length(alpha.so), sub.da) # Divide the parameter space based on alpha parameter
+alf <- 1                                   # Run CV in the first parameter subset 
+
+# Cross-validation of MDR analysis    
+if(do.MDR.CV){
+  alpha.s <- alpha.so[afsp[alf, 1]:afsp[alf, 2]] # Subset parameter space
+  cv.ind <- cv.MDR.demo(ds, ds_tp1, dmatrix.list = dmatrix.train.mvx, 
+                        parall = T, ncore = 24, keep_intra = T,alpha.seq = alpha.s)
+  # To avoid overwrite the original files, we save them with different names, 'XXX_NEW'.
+  saveRDS(cv.ind, paste(da.name, 'nin', nin, 'cvunit', cv.unit, 'alph', alpha.s[1]*100, DAY, 'cvout_Nmvx_Rallx.obj', sep = '_'))
+}
+```
+
+##### [4.4.3] Selecting the optimal parameters
+Select the optimal parameter set for regularized regression model with the minimal MSE
+
+```{r}
+paracv.demo <- secv.demo(cv.ind)
+paracv.demo
+```
+#### [4.5] MDR S-map
+Fitting MDR S-map based on the parameters selected by CV
+
+Note that the linear regression model in MDR S-map includes all of variables as X even if some of them were not selected as the causal variables at the step of using CCM. This is reasonable because S-map coefficients represent the effects of variables at short timescale while CCM evaluates the causality in the whole period of the time series. 
+```{r}
+#Setting
+do.MDR <- F
+cv.unit <- 0.025                           
+ptype <- 'aenet'          #enet:elastic-net or msaenet: adaptive elastic-net
+
+#Fitting the MDR S-map
+smap.2H2P <- MDRsmap.demo(paracv = paracv.demo, ptype = ptype, keep_intra = T, out.sample = T,
+                            ds,ds_tp1,ds.test,dst_tp1,
+                            dmatrix.list = dmatrix.train.mvx,
+                            dmatrix.test.list = dmatrix.test.mvx)
+```
+
+In case for saving the results
+```{r}
+DAY = Sys.Date()
+nr.out <- smap.2H2P[['nr.out']];
+
+  saveRDS(nr.out, paste(da.name,'_nin', nin, 'cvunit', cv.unit, ptype, DAY, 'nrout_Nmvx_Rallx_demo_NEW.obj',sep = '_'))
+    # Save interaction Jacobian matrices at all time points
+  saveRDS(smap.2H2P[['jcof']], paste(da.name,'nin', nin, 'cvunit', cv.unit, ptype, DAY, '_jcof_Nmvx_Rallx_demo_NEW.obj', sep='_'))
+
+```
+
+S-map coefficients
+```{r}
+smap.2H2P[['jcof']]
+```
+#### [4.6] Compare S-map coefficients and theoretical benchmark
+Loading data
+```{r}
+smap.2H2P <- list()
+smap.2H2P[['jcof']] <- readRDS("4p_model_nin_198_cvunit_0.025_aenet_2024-07-31__jcof_Nmvx_Rallx_demo_NEW.obj")
+smap.2H2P[['jcof']]
+```
+##### [4.6.1] Compare multivariate S-map and MDR S-map
+```{r}
+final_ID <- 200
+delta_11 <- 1
+
+MDR_Smap_dH1dH1 <- subset(smap.2H2P[['jcof']], variable == j_Host1)[1:199, 5] - delta_11
+MDR_Smap_dH1dH2 <- subset(smap.2H2P[['jcof']], variable == j_Host1)[1:199, 6]
+MDR_Smap_dH1dP1 <- subset(smap.2H2P[['jcof']], variable == j_Host1)[1:199, 7]
+MDR_Smap_dH1dP2 <- subset(smap.2H2P[['jcof']], variable == j_Host1)[1:199, 8]
+
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11, type = "l", col = 1, ylim = c(-0.9, 1.0), xlab = "time", ylab = "Interation coefficients")
+par(new = T)
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_2[-final_ID], type = "l", col = "red", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+par(new = T)
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID], type = "l", col = "blue", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+par(new = T)
+plot(HP_result$t[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_4[-final_ID], type = "l", col = "green", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+par(new = T)
+plot(HP_result$t[-final_ID], MDR_Smap_dH1dH1, type = "l", col = "brown", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+par(new = T)
+plot(HP_result$t[-final_ID], MDR_Smap_dH1dP1, type = "l", col = "cyan", ylim = c(-0.9, 1.0), xlab = "", ylab = "")
+
+legend("topright", 
+          legend = c("S-map from H1 to H1 - delta11", "S-map from H2 to H1", "S-map from P1 to H1", "S-map from P2 to H1","MDR S-map from H1 to H1 - delta11", "MDR S-map from P1 to H1"),  
+          col = c("black", "red", "blue", "green", "brown", "cyan"), 
+          lty = c(1, 1, 1, 1, 1, 1),              
+          cex = 0.8)   
+```
+##### [4.6.2] List of theoretical Jacobian
+
+\[
+\frac{\partial F_{H,i}}{\partial H_{i,k}} = -1 + (1 - a_i H_i) e ^ {-a_i H_i - c_{1i} P_1 - c_{2i} P_2} (r_i + e ^{-m_{H,i}})
+\]
+\[
+\frac{\partial F_{H,i}}{\partial H_{i',k}} = 0 
+\]
+\[
+\frac{\partial F_{H,i}}{\partial P_{j,k}} = c_{ji} e ^ {-a_i H_i - c_{1i} P_1 - c_{2i} P_2} (-r_i - e ^ {-m_{H,i}}) H_k
+\]
+
+
+Functions for partial derivatives for H1:
+```{r}
+dF_H1dH1 <- function(data) {
+  coeff <- -1 + (1 - a1 * data$H1) * exp(- a1 * data$H1 - c11 * data$P1 - c21 * data$P2) * (r1 + exp(- mH1))
+  
+  return(coeff)
+}
+
+dF_H1dP1 <- function(data) {
+  coeff <- c11 * exp(- a1 * data$H1 - c11 * data$P1 - c21 * data$P2) * (- r1 - exp(- mH1)) * data$H1
+  
+  return(coeff)
+}  
+
+dF_H1dP2 <- function(data) {
+  coeff <- c21 * exp(- a1 * data$H1 - c11 * data$P1 - c21 * data$P2) * (- r1 - exp(- mH1)) * data$H1
+  
+  return(coeff)
+}
+```
+
+##### [4.6.3] Comparison for the diagonal element (Fig. 2ab: H1 -> H1): ggplot
+
+Dataframe for ggplot
+```{r}
+#For lineplots
+H2P2_H1toH1_ggplot <- data.frame(
+  time = HP_result$t[-final_ID],
+  IntS = HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11,
+  type = rep("01std_smapH1toH1", 199)
+)
+H2P2_H1toH1_ggplot <- rbind.data.frame(
+  H2P2_H1toH1_ggplot, data.frame(
+    time = HP_result$t[-final_ID],
+    IntS = MDR_Smap_dH1dH1,
+    type = rep("02mdr_smapH1toH1", 199)
+  )
+)
+H2P2_H1toH1_ggplot <- rbind.data.frame(
+  H2P2_H1toH1_ggplot, data.frame(
+    time = HP_result$t[-final_ID],
+    IntS = dF_H1dH1(HP_result)[-final_ID],
+    type = rep("03IS_dH1dH1", 199)
+  )
+)
+                                
+H2P2_P1toH1_ggplot <- data.frame(
+  time = HP_result$t[-final_ID],
+  IntS = HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID],
+  type = rep("01std_smapP1toH1", 199)
+)
+H2P2_P1toH1_ggplot <- rbind.data.frame(
+  H2P2_P1toH1_ggplot, data.frame(
+    time = HP_result$t[-final_ID],
+    IntS = MDR_Smap_dH1dP1,
+    type = rep("02mdr_smapP1toH1", 199)
+  )
+)
+H2P2_P1toH1_ggplot <- rbind.data.frame(
+  H2P2_P1toH1_ggplot, data.frame(
+    time = HP_result$t[-final_ID],
+    IntS = dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1],
+    type = rep("03IS_dH1dP1", 199)
+  )
+)
+
+
+#For error plots
+H2P2_error_H1toH1_ggplot <- data.frame(
+  time = HP_result$t[-final_ID],
+  IntS = HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11 - dF_H1dH1(HP_result)[-final_ID],
+  type = rep("01std_smapH1toH1", 199)
+)
+H2P2_error_H1toH1_ggplot <- rbind.data.frame(
+  H2P2_error_H1toH1_ggplot, data.frame(
+    time = HP_result$t[-final_ID],
+    IntS = MDR_Smap_dH1dH1 - dF_H1dH1(HP_result)[-final_ID],
+    type = rep("02mdr_smapH1toH1", 199)
+  )
+)
+
+H2P2_error_P1toH1_ggplot <- data.frame(
+  time = HP_result$t[-final_ID],
+  IntS = HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID] - dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1],
+  type = rep("01std_smapP1toH1", 199)
+)
+H2P2_error_P1toH1_ggplot <- rbind.data.frame(
+  H2P2_error_P1toH1_ggplot, data.frame(
+    time = HP_result$t[-final_ID],
+    IntS = MDR_Smap_dH1dP1 - dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1],
+    type = rep("02mdr_smapP1toH1", 199)
+  )
+)
+```
+
+```{r}
+fig2a_ggplot <- ggplot(data = H2P2_H1toH1_ggplot) +
+  scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00")) +
+  scale_shape_manual(values = c(15, 16, 17)) +
+　geom_line(aes(x = time, y = IntS, group = type, color = type)) +
+  geom_point(aes(x = time, y = IntS, color = type, shape = type), size = 2) +
+  xlim(1800, 1999) + theme_bw() + theme(legend.position = "bottom") +  
+  labs(title = "Figure 2a: Time evolution of H1 -> H1", x = "time", y = "H1 -> H1") 
+
+fig2b_ggplot <- ggplot(H2P2_error_H1toH1_ggplot, aes(type, abs(IntS))) +
+    scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00")) +
+    scale_shape_manual(values = c(15, 16, 17)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(shape = type, color = type, alpha = 0.1), width = 0.25, size = 3) +
+    theme_bw() + theme(legend.position = "bottom") + 
+    labs (title = "Figure 2b: Comparison to parametric IS: H1 -> H1") 
+
+plot(fig2a_ggplot)
+ggsave("fig2a.pdf", width = 6, height = 4)
+plot(fig2b_ggplot)
+ggsave("fig2b.pdf", width = 4, height = 4)
+```
+
+##### [4.6.4] Comparison for the off-diagonal element (Fig. 2cd: P1 -> H1): ggplot
+
+```{r}
+fig2c_ggplot <- ggplot(data = H2P2_P1toH1_ggplot) +
+  scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00")) +
+  scale_shape_manual(values = c(15, 16, 17)) +
+　geom_line(aes(x = time, y = IntS, group = type, color = type)) +
+  geom_point(aes(x = time, y = IntS, color = type, shape = type), size = 2) +
+  xlim(1800, 1999) + theme_bw() + theme(legend.position = "bottom") +   
+  labs(title = "Figure 2c: Time evolution of P1 -> H1", x = "time", y = "P1 -> H1") 
+
+fig2d_ggplot <- ggplot(H2P2_error_P1toH1_ggplot, aes(type, abs(IntS))) +
+    scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00")) +
+    scale_shape_manual(values = c(15, 16, 17)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(shape = type, color = type, alpha = 0.1), width = 0.25, size = 3) +
+    theme_bw() + theme(legend.position = "bottom") +  
+    labs (title = "Figure 2d: Comparison to parametric IS: P1 -> H1") 
+
+plot(fig2c_ggplot)
+ggsave("fig2c.pdf", width = 6, height = 4)
+plot(fig2d_ggplot)
+ggsave("fig2d.pdf", width = 4, height = 4)
+
+```
+
+##### [4.6.5] Comparison for both diagonal and off-diagonal by correlation/regression
+```{r}
+#for diagonal element (H1 -> H1)
+plot(dF_H1dH1(HP_result)[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11, 
+     xlab = "theoretical coefficient (H1 -> H1)",
+     ylab = "standard S-map coefficient (H1 -> H1)",
+     )
+abline(coef = c(0,1))
+
+cor(dF_H1dH1(HP_result)[-final_ID], HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11)
+#Y should be the theoretical coefficient
+x <- HP_m_smap_res2_s$smap_coefficients[[1]]$c_1[-final_ID] - delta_11
+summary(lm(dF_H1dH1(HP_result)[-final_ID] ~ x))
+
+plot(dF_H1dH1(HP_result)[-final_ID], MDR_Smap_dH1dH1,
+     xlab = "theoretical coefficient (H1 -> H1)",
+     ylab = "MDR S-map coefficient (H1 -> H1)"
+     )
+abline(coef = c(0,1))
+
+cor(dF_H1dH1(HP_result)[-final_ID], MDR_Smap_dH1dH1)
+summary(lm(dF_H1dH1(HP_result)[-final_ID] ~ MDR_Smap_dH1dH1))
+
+#for off-diagonal element (P1 -> H1)
+plot(dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1], HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID],
+     xlab = "theoreticalcoefficient (P1 -> H1)",
+     ylab = "standard S-map coefficient (P1 -> H1)"
+     )
+abline(coef = c(0,1))
+
+cor(dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1], HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID])
+y <- dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1]
+summary(lm(y ~ HP_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID]))
+
+plot(dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1], MDR_Smap_dH1dP1,
+     xlab = "theoreticalcoefficient (P1 -> H1)",
+     ylab = "MDR S-map coefficient (P1 -> H1)"
+     )
+abline(coef = c(0,1))
+
+cor(MDR_Smap_dH1dP1, dF_H1dP1(HP_result)[-final_ID] * HP_result.sd[3] / HP_result.sd[1])
+summary(lm(y ~ MDR_Smap_dH1dP1))
+                                                                
+```
+
+
+### [5] Model02 setting
+#### [5.1] Model equations for the 5-species coupled food chain ODE model
+\[
+\frac{dP_i}{dt} = v_i \lambda_i \frac{P_i C_i}{C_i + C_i^*} - v_i P_i, \quad (i=1,2) \tag{1}
+\]
+
+\[
+\frac{dC_i}{dt} = \mu_i \kappa_i \frac{C_i R}{R + R^*} - v_i \lambda_i \frac{P_i C_i}{C_i + C_i^*} - \mu_i C_i, \quad (i=1,2) \tag{2}
+\]
+
+\[
+\frac{dR}{dt} = R \left( 1 - \frac{R}{k} \right) - \sum_{i=1,2} \mu_i \kappa_i \frac{C_iR}{R + R^*}.\tag{3}
+\]
+
+#### [5.2] Parameters and settings for the 5-species coupled food chain ODE model
+##### [5.2.1] Parameter value setting
+```{r}
+v1 <- 0.1
+v2 <- 0.07
+lambd1 <- 3.2
+lambd2 <- 2.9
+Cstar1 <- 0.5
+Cstar2 <- 0.5
+myu1 <- 0.15
+myu2 <- 0.15
+kp1 <- 2.5
+kp2 <- 2.0
+Rstar <- 0.3
+k <- 1.2
+```
+##### [5.2.2] Settings for numerically solving ODEs
+```{r}
+j_P1 <- 1
+j_P2 <- 2
+j_C1 <- 3
+j_C2 <- 4
+j_R <- 5
+```
+##### [5.2.3] Functions specific to the 5-sp model
+```{r}
+dP1dt <- function(in_vec, t)
+{
+  growth <- v1 * lambd1 * in_vec[j_P1] * in_vec[j_C1] / (in_vec[j_C1] + Cstar1)
+  mortality <- v1 * in_vec[j_P1]
+  return(growth - mortality)
+}
+
+dP2dt <- function(in_vec, t)
+{
+  growth <- v2 * lambd2 * in_vec[j_P2] * in_vec[j_C2] / (in_vec[j_C2] + Cstar2)
+  mortality <- v2 * in_vec[j_P2]
+  return(growth - mortality)
+}
+
+dC1dt <- function(in_vec, t)
+{
+  growth <- myu1 * kp1 * in_vec[j_C1] * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  mortality <- v1 * lambd1 * in_vec[j_P1] * in_vec[j_C1] / (in_vec[j_C1] + Cstar1) + myu1 * in_vec[j_C1]
+  return(growth - mortality)
+}
+
+dC2dt <- function(in_vec, t)
+{
+  growth <- myu2 * kp2 * in_vec[j_C2] * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  mortality  <- v2 * lambd2 * in_vec[j_P2] * in_vec[j_C2] / (in_vec[j_C2] + Cstar2) + myu2 * in_vec[j_C2]
+  return(growth - mortality)
+}
+
+dRdt <- function(in_vec, t)
+{
+  growth <- in_vec[j_R] * (1.0 - in_vec[j_R] / k)
+  mortality <- myu1 * kp1 * in_vec[j_C1] * in_vec[j_R] / (in_vec[j_R] + Rstar) + myu2 * kp2 * in_vec[j_C2] * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  return(growth - mortality)
+}
+
+#function to calculate all coefficients, five dimensional
+diff_5sp <- function(in_vec, ref_data, t, h_interval, dim){
+  temp_vec <- numeric(dim)
+  temp_vec[j_P1] <- dP1dt(in_vec, t)
+  temp_vec[j_P2] <- dP2dt(in_vec, t)
+  temp_vec[j_C1] <- dC1dt(in_vec, t)
+  temp_vec[j_C2] <- dC2dt(in_vec, t)
+  temp_vec[j_R] <- dRdt(in_vec, t)
+  temp_vec
+}  
+```
+##### [5.2.4] Initial setting and conditions
+```{r}
+dim_model1 <- 5
+nv0 <- numeric(dim_model1)
+nv <- numeric(dim_model1)
+
+nv0[j_R] <- 1.0
+nv0[j_C1] <- 0.5
+nv0[j_C2] <- 0.8
+nv0[j_P1] <- 0.7
+nv0[j_P2] <- 0.8
+
+deltat <- 0.01
+```
+
+#### [5.3] Solving the model
+##### [5.3.1] Solving the model by the RK4 method
+```{r}
+t <- 0.0  # initial condition (initial time, 0)
+end_time <- 2000; tau <- 5; transient_period <- 1000
+write_index <- 1
+
+#Initial condition set
+nv <- nv0 
+
+#write initial condition
+cat(t, nv, "\n")
+
+#For the transient dynamics (RUN BURN)
+for(i in 1:as.integer(transient_period / deltat)){
+  nv <- rk4(in_vec = nv, time = t, h_interval = deltat, dim = dim_model1, diff_vec = diff_5sp)
+  t <- t + deltat # update time
+}
+
+# record the initial condition after BURNING phase
+rk4_result <- data.frame(t = t, P1 = nv[j_P1], P2 = nv[j_P2], C1 = nv[j_C1], C2 = nv[j_C2], R = nv[j_R])
+
+#After transient period
+for(i in 1:as.integer((end_time - transient_period) / deltat)){
+  nv <- rk4(in_vec = nv, time = t, h_interval = deltat, dim = dim_model1, diff_vec = diff_5sp)
+  t <- t + deltat # update time
+  ###record the result every "tau only
+  if(write_index < as.integer(tau / deltat)){
+    write_index <- write_index + 1
+  }
+  else {
+    #cat(time, nv_ee1,"\n")
+    rk4_result <- rbind.data.frame(rk4_result, c(t, nv[j_P1], nv[j_P2], nv[j_C1], nv[j_C2], nv[j_R]))
+    write_index <- 1
+  }
+}
+head(rk4_result)
+
+saveRDS(rk4_result, "rk4_result_5sp_model.obj")
+```
+
+##### [5.3.2] Basic plot for the result
+```{r}
+plot(rk4_result$t, rk4_result$C1, col = "red", type = "l", xlab = "time", ylab = "abundance", ylim = c(0, 2.0))
+par(new = T)
+plot(rk4_result$t, rk4_result$C2, col = "blue", type = "l", xlab = "", ylab = "", ylim = c(0, 2.0))
+par(new = T)
+plot(rk4_result$t, rk4_result$R, col = "green", type = "l", xlab = "", ylab = "", ylim = c(0, 2.0))
+```
+### [6] Theoretical coefficients evaluated by instantaneous Jacobian
+The partial derivative of dC1/dt 
+
+
+with respect to C1:
+\[
+\frac{\partial}{\partial C_{1}} \left( \mu_{1} K_{1} \frac{C_{1} R}{R + R^{*}} - v_{1} \lambda_{1} \frac{P_{1} C_{1}}{C_{1} + C_{1}^{*}} - \mu_{1} C_{1} \right) = K_{1} \mu_{1} \frac{R}{R + R^{*}} - v_{1} \lambda_{1} \frac{P_{1} C_{1}*}{(C_{1} + C_{1}^{*})^2} - \mu_{1}
+\]
+
+with respect to R:
+\[
+\frac{\partial}{\partial R} \left( \mu_{1} \kappa_{1} \frac{C_{1} R}{R + R^{*}} \right) = \kappa_{1} \mu_{1} \frac{C_{1} R^*}{(R + R^{*})^2}
+\]
+
+
+Function definition
+```{r}
+dC1dC1 <- function(data) {
+  coeff <- myu1 * kp1 * data$R / (data$R + Rstar) - v1 * lambd1 * data$P1 * Cstar1/ (data$C1 + Cstar1)^2 - myu1
+  return(coeff)
+}
+dC1dR <- function(data) {
+  coeff <- myu1 * kp1 * data$C1 *Rstar / (data$R + Rstar)^2
+  return(coeff)
+}
+```
+
+
+### [7] Adjusted interaction strengths with multivariate S-map
+Based on https://ushio-ecology-blog.blogspot.com/2019/12/20191225blogger0007.html
+
+#### [7.1] Analysis with standardization
+##### [7.1.1] Standardization
+```{r}
+rk4_result.mean <- apply(rk4_result[, -1], 2, mean, na.rm = T)  # mean abundance
+rk4_result.sd <- apply(rk4_result[, -1], 2, sd, na.rm = T)      # SD of abundance 
+
+mean_mat <- matrix(rk4_result.mean, nrow = nrow(rk4_result) , ncol = length(rk4_result.mean), byrow = TRUE)
+sd_mat <- matrix(rk4_result.sd, nrow = nrow(rk4_result) , ncol = length(rk4_result.mean), byrow = TRUE)
+
+rk4_result_s <- (rk4_result[, -1] - mean_mat) /sd_mat # Standardized dataset
+head(rk4_result_s)
+```
+
+##### [7.1.2] Analaysis with the standardized time series data 
+```{r}
+# data block for smap
+rk4_smap_block_s <- data.frame(P1 = rk4_result_s$P1, P2 = rk4_result_s$P2, C1 = rk4_result_s$C1, C2 = rk4_result_s$C2, R = rk4_result_s$R)
+
+# delete a few column
+#rk4_smap_block_s <- rk4_smap_block_s[, -j_P2] #delete P2 from the embedding
+
+# conducting smap for obtaining the optimal theta
+rk4_m_smap_res_s <- block_lnlp(rk4_smap_block_s, method = "s-map",
+                         target_column = j_C1, 
+                         theta = c(0, 1e-04, 3e-04, 0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8),
+                         silent = TRUE)
+```
+Plotting the effect of theta
+```{r}
+plot(rk4_m_smap_res_s$theta, rk4_m_smap_res_s$rmse, type = "b")
+(rk4_opt_theta_s <- rk4_m_smap_res_s$theta[which.min(rk4_m_smap_res_s$rmse)])
+```
+Conducting standard smap with the optimal theta
+```{r}
+rk4_m_smap_res2_s <- block_lnlp(rk4_smap_block_s, method = "s-map", 
+                              target_column = j_C1, 
+                              theta = rk4_opt_theta_s, 
+                              silent = TRUE, 
+                              save_smap_coefficients = TRUE)
+head(as.data.frame(rk4_m_smap_res2_s$smap_coefficients[[1]]))
+```
+
+
+#### [7.2] Compare standard S-map and instantaneous interaction strengths (IIS)
+```{r}
+final_ID <- 201
+plot(rk4_result$t[-final_ID], rk4_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID] - 1.0, type = "l", col = 1, ylim = c(-1, 1), xlab = "time", ylab = "Smap coefficient: C1 -> C1")
+par(new = T)
+plot(rk4_result$t[-final_ID], tau*dC1dC1(rk4_result)[-final_ID], type = "l", col = "blue", ylim = c(-1, 1), xlab = "", ylab = "")
+```
+### [8] Deriving mathematically correct interaction coefficients
+#### [8.1] Model setting
+##### [8.1.1] List of partial derivatives (Jacobian)
+\[
+\frac{\partial F_{P_1}}{\partial P_1} = v_1 \lambda_1 \frac{C_1}{C_1 + C_1^*} - v_1,
+\frac{\partial F_{P_1}}{\partial P_2} = 0, 
+\frac{\partial F_{P_1}}{\partial C_1} = v_1 \lambda_1 \frac{P_1 C_1^*}{(C_1 + C_1^*)^2},
+\frac{\partial F_{P_1}}{\partial C_2} = \frac{\partial F_{P_1}}{\partial R} = 0,  
+\]
+
+\[
+\frac{\partial F_{P_2}}{\partial P_1} = 0, 
+\frac{\partial F_{P_2}}{\partial P_2} = v_2 \lambda_2 \frac{C_2}{C_2 + C_2^*} - v_2, 
+\frac{\partial F_{P_2}}{\partial C_1} = 0, 
+\frac{\partial F_{P_2}}{\partial C_2} = v_2 \lambda_2 \frac{P_2 C_2^*}{(C_2 + C_2^*)^2}, 
+\frac{\partial F_{P_2}}{\partial R} = 0,  
+\]
+
+\[
+\frac{\partial F_{C_1}}{\partial P_1} = -v_1 \lambda_1 \frac{C_1}{C_1 + C_1^*},
+\frac{\partial F_{C_1}}{\partial P_2} = 0, 
+\frac{\partial F_{C_1}}{\partial C_1} = \mu_1 \kappa_1 \frac{R}{R + R^*} - v_1 \lambda_1 \frac{P_1 C_1^*}{(C_1 + C_1^*)^2} - \mu_1, 
+\frac{\partial F_{C_1}}{\partial C_2} = 0,
+\frac{\partial F_{C_1}}{\partial R} = \mu_1 \kappa_1 \frac{C_1 R^*}{(R + R^*)^2},  
+\]
+
+\[
+\frac{\partial F_{C_2}}{\partial P_1} = 0, 
+\frac{\partial F_{C_2}}{\partial P_2} = -v_2 \lambda_2 \frac{C_2}{C_2 + C_2^*},
+\frac{\partial F_{C_2}}{\partial C_1} = 0,
+\frac{\partial F_{C_2}}{\partial C_2} = \mu_2 \kappa_2 \frac{R}{R + R^*} - v_2 \lambda_2 \frac{P_2 C_2^*}{(C_2 + C_2^*)^2} - \mu_2, 
+\frac{\partial F_{C_2}}{\partial R} = \mu_2 \kappa_2 \frac{C_2 R^*}{(R + R^*)^2},  
+\]
+
+\[
+\frac{\partial F_{R}}{\partial P_1} = \frac{\partial F_{R}}{\partial P_2} = 0, 
+\frac{\partial F_{R}}{\partial C_1} = - \mu_1 \kappa_1 \frac{R}{R + R^*},
+\frac{\partial F_{R}}{\partial C_2} = - \mu_2 \kappa_2 \frac{R}{R + R^*},
+\frac{\partial F_{R}}{\partial R} = \left( 1 - \frac{2 R}{k} \right)- \sum_{i=1,2} \mu_i \kappa_i \frac{C_i R^*}{(R + R^*)^2}.
+\]
+
+##### [8.1.2] Functions specific to the linearized model
+Partial derivatives
+```{r}
+rF_P1rX <- function(in_vec, t) {
+  nv_p <- numeric(length(in_vec))
+  
+  nv_p[j_P1] <- v1 * lambd1 * in_vec[j_C1] / (in_vec[j_C1] + Cstar1) - v1
+  nv_p[j_P2] <- 0
+  nv_p[j_C1] <- v1 * lambd1 * in_vec[j_P1] * Cstar1 / (in_vec[j_C1] + Cstar1)^2
+  nv_p[j_C2] <- 0
+  nv_p[j_R] <- 0
+  
+  return(nv_p)
+}
+
+rF_P2rX <- function(in_vec, t) {
+  nv_p <- numeric(length(in_vec))
+  
+  nv_p[j_P2] <- v2 * lambd2 * in_vec[j_C2] / (in_vec[j_C2] + Cstar2) - v2
+  nv_p[j_P1] <- 0
+  nv_p[j_C2] <- v2 * lambd2 * in_vec[j_P2] * Cstar2 / (in_vec[j_C2] + Cstar2)^2
+  nv_p[j_C1] <- 0
+  nv_p[j_R] <- 0
+  
+  return(nv_p)
+}
+
+rF_C1rX <- function(in_vec, t) {
+  nv_p <- numeric(length(in_vec))
+  
+  nv_p[j_P1] <- -v1 * lambd1 * in_vec[j_C1] / (in_vec[j_C1] + Cstar1)
+  nv_p[j_P2] <- 0
+  nv_p[j_C1] <- myu1 * kp1 * in_vec[j_R] / (in_vec[j_R] + Rstar) - v1 * lambd1 * in_vec[j_P1] * Cstar1/ (in_vec[j_C1] + Cstar1)^2 - myu1
+  nv_p[j_C2] <- 0
+  nv_p[j_R] <- myu1 * kp1 * in_vec[j_C1] * Rstar / (in_vec[j_R] + Rstar)^2
+  
+  return(nv_p)
+}
+
+rF_C2rX <- function(in_vec, t) {
+  nv_p <- numeric(length(in_vec))
+  
+  nv_p[j_P2] <- -v2 * lambd2 * in_vec[j_C2] / (in_vec[j_C2] + Cstar2)
+  nv_p[j_P1] <- 0
+  nv_p[j_C2] <- myu2 * kp2 * in_vec[j_R] / (in_vec[j_R] + Rstar) - v2 * lambd2 * in_vec[j_P2] * Cstar2/ (in_vec[j_C2] + Cstar2)^2 - myu2
+  nv_p[j_C1] <- 0
+  nv_p[j_R] <- myu2 * kp2 * in_vec[j_C2] * Rstar / (in_vec[j_R] + Rstar)^2
+  
+  return(nv_p)
+}
+
+rF_RrX <- function(in_vec, t) {
+  nv_p <- numeric(length(in_vec))
+  
+  nv_p[j_P1] <- 0
+  nv_p[j_P1] <- 0
+  nv_p[j_C1] <- -myu1 * kp1 * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  nv_p[j_C2] <- -myu2 * kp2 * in_vec[j_R] / (in_vec[j_R] + Rstar)
+  nv_p[j_R] <- (1 - 2 * in_vec[j_R] / k) - (myu1 * kp1 * in_vec[j_C1] + myu2 * kp2 * in_vec[j_C2]) * Rstar / (in_vec[j_R] + Rstar)^2
+  
+  return(nv_p)
+}
+```
+Linearlized perturbed ODE system equations
+\[
+\frac{d\boldsymbol{\delta}(t)}{dt} = \mathbf{J}_{t} \boldsymbol{\delta}(t), \quad \boldsymbol{\delta}(0) = \Delta \boldsymbol{x}_{j}. \tag{7a}
+\]
+
+
+\begin{align}
+IC_{i,j,adj}(k=k_1) &=  \lim_{\Delta x \to 0} \frac{\left[\phi(\boldsymbol{x}(k_1) + \Delta x_j, \tau) - \phi(\boldsymbol{x}(k_1), \tau)\right]_i}{\Delta x} - \delta_{ij}\\
+&= \lim_{\Delta x \to 0} \frac{\left[\boldsymbol{\delta}_n (\tau)\right]_i}{\Delta x} - \delta_{ij} \\
+&\approx \frac{\left[\boldsymbol{\delta}_n (\tau)\right]_i}{\Delta x} - \delta_{ij} \tag{7c}
+\end{align}
+
+Linearlized ODE system
+```{r}
+dP1Ldt <- function(in_vec, ref_data, t)
+{
+  ref_vec <- as.numeric(ref_data[t, -1])
+  return(as.numeric(rF_P1rX(ref_vec) %*% in_vec))
+}
+
+dP2Ldt <- function(in_vec, ref_data, t)
+{
+  ref_vec <- as.numeric(ref_data[t, -1])
+  return(as.numeric(rF_P2rX(ref_vec) %*% in_vec))
+}
+
+dC1Ldt <- function(in_vec, ref_data, t)
+{
+  ref_vec <- as.numeric(ref_data[t, -1])
+  return(as.numeric(rF_C1rX(ref_vec) %*% in_vec))
+}
+
+dC2Ldt <- function(in_vec, ref_data, t)
+{
+  ref_vec <- as.numeric(ref_data[t, -1])
+  return(as.numeric(rF_C2rX(ref_vec) %*% in_vec))
+}
+
+dRLdt <- function(in_vec, ref_data, t)
+{
+  ref_vec <- as.numeric(ref_data[t, -1])
+  return(as.numeric(rF_RrX(ref_vec) %*% in_vec))
+}
+
+
+#function to calculate all coefficients, five dimensional
+diff_L_5sp <- function(in_vec, ref_data, t, h_interval, dim){
+  temp_vec <- numeric(dim)
+  
+  t_index <- as.integer((t / h_interval) * 2) #to convert continuous time to the number of row
+  
+  temp_vec[j_P1] <- dP1Ldt(in_vec, ref_data, t_index)
+  temp_vec[j_P2] <- dP2Ldt(in_vec, ref_data, t_index)
+  temp_vec[j_C1] <- dC1Ldt(in_vec, ref_data, t_index)
+  temp_vec[j_C2] <- dC2Ldt(in_vec, ref_data, t_index)
+  temp_vec[j_R] <- dRLdt(in_vec, ref_data, t_index)
+  temp_vec
+}  
+```
+#### [8.2] Solving the model
+##### [8.2.1] Preparing the fine solution of the ODEs without perturbation
+Since rk4() includes the evaluation of derivatives at t + deltat/2, we need to have numerical solutions with the high resolution with deltat/2
+```{r}
+t <- 0.0  # initial condition (initial time, 0)
+end_time <- 2000; tau <- 5; transient_period <- 1000
+write_index <- 1
+deltat_fine <- deltat * 0.5
+
+#Initial condition set
+nv_rk4_fine <- nv0 
+
+# write initial condition
+cat(t, nv_rk4_fine, "\n")
+
+#For the transient dynamics (RUN BURN)
+for(i in 1:as.integer(transient_period / deltat_fine)){
+  nv_rk4_fine <- rk4(in_vec = nv_rk4_fine, time = t, h_interval = deltat_fine, dim = dim_model1, diff_vec = diff_5sp)
+  t <- t + deltat_fine # update time
+}
+
+# record the initial condition after BURNING period
+rk4_result_fine <- data.frame(t = t, P1 = nv_rk4_fine[j_P1], P2 = nv_rk4_fine[j_P2], C1 = nv_rk4_fine[j_C1], C2 = nv_rk4_fine[j_C2], R = nv_rk4_fine[j_R])
+
+#After transient period
+for(i in 1:as.integer((end_time - transient_period) / deltat_fine)){
+  nv_rk4_fine <- rk4(in_vec = nv_rk4_fine, time = t, h_interval = deltat_fine, dim = dim_model1, diff_vec = diff_5sp)
+  t <- t + deltat_fine # update time
+  rk4_result_fine <- rbind.data.frame(rk4_result_fine, c(t, nv_rk4_fine[j_P1], nv_rk4_fine[j_P2], nv_rk4_fine[j_C1], nv_rk4_fine[j_C2], nv_rk4_fine[j_R]))
+}
+
+head(rk4_result_fine)
+#saveRDS(rk4_result_fine, paste("default", "_rk4_result_fine.obj", sep=""))
+#saveRDS(rk4_result_fine, paste(Sys.Date(), "_rk4_result_fine.obj", sep=""))
+        
+```
+Comparing the solution 
+```{r}
+plot(rk4_result$t, rk4_result$C1, col = "red", type = "l", xlab = "time", ylab = "abundance", ylim = c(0, 2.0))
+par(new = T)
+plot(rk4_result_fine$t, rk4_result_fine$C1, col = "black", type = "l", xlab = "", ylab = "", ylim = c(0, 2.0), lty = "dashed")
+```
+
+
+##### [8.2.2] Trial for the linearized ODEs for a short time period
+```{r}
+#loading the default
+rk4_result_fine <- readRDS("default_rk4_result_fine.obj")
+
+delta_x = 0.01 #size of a small perturbation
+t <- deltat / 2  # initial condition (initial time, t_abs = transient_period)
+t_abs <- t + transient_period - deltat / 2
+end_time <- 1.0; tau <- 5;
+write_index <- 1
+
+#Initial condition 
+nv_linear_p <- c(0, 0, delta_x, 0, 0)
+# record the initial condition
+result_linear_p <- data.frame(t = t_abs, P1 = nv_linear_p[j_P1], P2 = nv_linear_p[j_P2], C1 = nv_linear_p[j_C1], C2 = nv_linear_p[j_C2], R = nv_linear_p[j_R])
+  
+for(i in 1:as.integer(end_time / deltat)){
+  nv_linear_p <- rk4(in_vec = nv_linear_p, ref_data = rk4_result_fine, time = t, h_interval = deltat, dim = dim_model1, diff_vec = diff_L_5sp)
+  t <- t + deltat # update time (starting from the middle)
+  t_abs <- t_abs + deltat
+  result_linear_p <- rbind.data.frame(result_linear_p, c(t_abs, nv_linear_p[j_P1], nv_linear_p[j_P2], nv_linear_p[j_C1], nv_linear_p[j_C2], nv_linear_p[j_R]))
+}
+ result_linear_p
+
+```
+The direct evaluation by the nonlinear ODE
+```{r}
+t <- 1000 - transient_period + deltat / 2  # initial condition (initial time, t_abs = start_t)
+t_index_start <- as.integer((t / deltat) * 2)
+t_index_end <- t_index_start + as.integer((1.0 / deltat) * 2)
+#Initial condition 
+nv_nonlinear_p <- as.numeric(rk4_result_fine[t_index_start, -1]) + c(0, 0, delta_x, 0, 0)
+
+# record the initial condition
+result_nonlinear_p <- data.frame(t = t_abs, P1 = nv_nonlinear_p[j_P1], P2 = nv_nonlinear_p[j_P2], C1 = nv_nonlinear_p[j_C1], C2 = nv_nonlinear_p[j_C2], R = nv_nonlinear_p[j_R])
+  
+for(i in 1:as.integer(end_time / deltat)){
+  nv_nonlinear_p <- rk4(in_vec = nv_nonlinear_p, time = t, h_interval = deltat, dim = dim_model1, diff_vec = diff_5sp)
+  t <- t + deltat # update time (starting from the middle)
+}
+ nv_nonlinear_p - as.numeric(rk4_result_fine[t_index_end, -1]) #difference between perturbed and unperturbed solutions
+
+```
+
+##### [8.2.3] Functions to calculate the interaction strength
+```{r}
+#ref_data: the dataset that includes the fine resolution solution of the target nonlinear ODE systems, of which record started at absolute time = transient_period
+#deltax: the size of perturbation at t = h_interval/2
+#start_t: usually specified as transient_period
+#tau: the interval for the calculation
+#dim: dimension of ODE system
+#diff_vec: the vector field generated by the linearized ODEs with non-perturbed solution
+precise_coeff <- function(ref_data, deltax, start_t, tau, h_interval, dim, diff_vec) {
+  #matrix to stock results
+  nv_linear_p <- matrix(0, nrow = dim, ncol = dim)
+  
+  #Initial condition 
+  nv_linear_p[, j_P1] <- c(deltax, 0, 0, 0, 0)
+  nv_linear_p[, j_P2] <- c(0, deltax, 0, 0, 0)
+  nv_linear_p[, j_C1] <- c(0, 0, deltax, 0, 0)
+  nv_linear_p[, j_C2] <- c(0, 0, 0, deltax, 0)
+  nv_linear_p[, j_R] <- c(0, 0, 0, 0, deltax)
+  
+  tzero <- start_t - transient_period + h_interval / 2  # initial condition (initial time, t_abs = start_t)
+  end_time <- tau
+  
+  for(j in 1:dim) {
+    t <- tzero #initialize time for each of different initial perturbations
+    for(i in 1:as.integer(end_time / deltat)){
+    nv_linear_p[, j] <- rk4(nv_linear_p[, j], ref_data, t, h_interval, dim, diff_vec)
+    t <- t + h_interval # update time (starting from the middle)
+    }
+  }
+    
+  return(nv_linear_p/deltax)
+}
+
+#This is a function that directly used the nonlinear ODE with the perturbed initial conditions
+direct_coeff <- function(ref_data, deltax, start_t, tau, h_interval, dim, diff_vec) {
+  #matrix to stock results
+  nv_nonlinear_p <- matrix(0, nrow = dim, ncol = dim)
+  
+  tzero <- start_t - transient_period + h_interval / 2  # initial condition (initial time, t_abs = start_t)
+  t_index_start <- as.integer((tzero / h_interval) * 2)
+  t_index_end <- t_index_start + as.integer((tau / h_interval) * 2)
+  #Initial condition 
+  nv_nonlinear_p[, j_P1] <- as.numeric(ref_data[t_index_start, -1]) + c(deltax, 0, 0, 0, 0)
+  nv_nonlinear_p[, j_P2] <- as.numeric(ref_data[t_index_start, -1]) + c(0, deltax, 0, 0, 0)
+  nv_nonlinear_p[, j_C1] <- as.numeric(ref_data[t_index_start, -1]) + c(0, 0, deltax, 0, 0)
+  nv_nonlinear_p[, j_C2] <- as.numeric(ref_data[t_index_start, -1]) + c(0, 0, 0, deltax, 0)
+  nv_nonlinear_p[, j_R] <- as.numeric(ref_data[t_index_start, -1]) + c(0, 0, 0, 0, deltax)
+  
+  end_time <- tau
+  
+ #rk4(in_vec = nv_rk4, time = t, h_interval = deltat, dim = dim_model1, diff_vec = diff_5sp)
+  
+  for(j in 1:dim) {
+    t <- tzero
+    for(i in 1:as.integer(end_time / deltat)){
+    nv_nonlinear_p[, j] <- rk4(nv_nonlinear_p[, j], ref_data = NULL, t, h_interval, dim, diff_vec)
+    t <- t + h_interval # update time (starting from the middle)
+    }
+  }
+  
+  #Calculate the difference between the perturbed flow and unperturbed flow
+  for(j in 1:dim) nv_nonlinear_p[, j] <- nv_nonlinear_p[, j] - as.numeric(ref_data[t_index_end, -1])  
+  
+  return(nv_nonlinear_p/deltax)
+}
+```
+
+##### [8.2.4] Linearized model for calculating all points from 1000 to 2000 with interval tau = 5
+The reference time points are every tau (= 5.0), but the precise_coeff was calculated for many scenarios (5.0, 0.01, 0.5, 1.0, 2.0, 10.0)
+```{r}
+precise_coeff_5sp <- list()
+inst_precise_coeff_5sp <- list()
+start_time <- vector()
+
+tau <- 5
+tau1 <- 5
+
+precise_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_linear <- precise_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau1, deltat, dim = 5, diff_L_5sp)
+  result_linear
+}, mc.cores = 16)
+
+tau2 <- 0.01
+inst_precise_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_linear <- precise_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau2, deltat, dim = 5, diff_L_5sp)
+  result_linear
+}, mc.cores = 16)
+
+tau3 <- 0.5
+tau0.5_precise_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_linear <- precise_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau3, deltat, dim = 5, diff_L_5sp)
+  result_linear
+}, mc.cores = 16)
+
+tau4 <- 1.0
+tau1.0_precise_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_linear <- precise_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau4, deltat, dim = 5, diff_L_5sp)
+  result_linear
+}, mc.cores = 16)
+
+tau5 <- 2.0
+tau2.0_precise_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_linear <- precise_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau5, deltat, dim = 5, diff_L_5sp)
+  result_linear
+}, mc.cores = 16)
+
+tau6 <- 10.0
+tau10.0_precise_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_linear <- precise_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau6, deltat, dim = 5, diff_L_5sp)
+  result_linear
+}, mc.cores = 16)
+
+
+precise_coeff_5sp[[5]]
+inst_precise_coeff_5sp[[5]]
+tau0.5_precise_coeff_5sp[[5]]
+
+#saveRDS(precise_coeff_5sp, "default_precise_coeff_5sp.obj")
+```
+##### [8.2.5] Nonlinear ODE model for calculating all points from 1000 to 2000 with interval tau = 5
+```{r}
+direct_coeff_5sp <- list()
+
+start_time <- vector()
+transient_period <- 1000
+
+direct_coeff_5sp <- mclapply(1:200, function(i) {
+  start_time[i] <- transient_period + (i - 1)*tau
+  result_nonlinear <- direct_coeff(rk4_result_fine, deltax = 0.0001, start_t = start_time[i], tau, deltat, dim = 5, diff_5sp)
+  result_nonlinear
+}, mc.cores = 16)
+
+direct_coeff_5sp[[5]]
+```
+Comparison between the linearized ODE and nonlinear ODE
+```{r}
+(precise_coeff_5sp[[5]] - direct_coeff_5sp[[5]])/direct_coeff_5sp[[5]]
+```
+### [9] MDR S-map
+Applying MDR S-map to the 5sp coupled foodchain model
+
+#### [9.1] Data prearrangement
+Read dataset
+```{r}
+da.range <- 1:200 # Subsample for data analysis
+out.sample <- T # T/F for out-of-sample forecast
+nout <- 2  # number of out-of-sample
+
+da.name <- '5p_model'
+do <- readRDS("rk4_result_5sp_model.obj")
+dot <- do[da.range, 1] # data time
+do <- do[da.range, -1] # subset of data without t
+ndo <- nrow(do)
+nin <- ndo - nout # library sample size
+```
+Standardization
+```{r}
+# In-sample
+do.mean <- apply(do[1:nin, ], 2, mean, na.rm = T)  # mean abundance in in-sample
+do.sd <- apply(do[1:nin, ], 2, sd, na.rm = T)      # SD of abundance in in-sample
+d <- do[1:(nin-1), ]                          # In-sample dataset at time t
+d_tp1 <- do[2:(nin), ]                        # In-sample dataset at time t+1
+ds <- (d - repmat(do.mean, nrow(d), 1))*repmat(do.sd, nrow(d), 1) ^ -1 # Normalized in-sample dataset at time t
+ds_tp1 <- (d_tp1 - repmat(do.mean, nrow(d_tp1), 1))*repmat(do.sd, nrow(d_tp1), 1) ^ -1 # Normalized in-sample dataset at time t+1
+
+# Out-sample
+if(out.sample & nout != 0){
+  d.test <- do[nin:(ndo - 1), ]                 # Out-of-sample dataset at time t 
+  dt_tp1 <- do[(nin + 1): ndo, ]                 # Out-of-sample dataset at time t+1
+  ds.test <- (d.test - repmat(do.mean, nrow(d.test), 1))*repmat(do.sd, nrow(d.test), 1) ^ -1 # Normalized out-of-sample dataset at time t
+  dst_tp1 <- (dt_tp1 - repmat(do.mean, nrow(dt_tp1), 1))*repmat(do.sd, nrow(dt_tp1), 1) ^ -1 # Normalized out-of-sample dataset at time t+1
+}else{d.test <- dt_tp1 <- ds.test <- NULL}
+
+# Compiled data at time t 
+ds.all <- rbind(ds, ds.test)
+head(ds.all)
+```
+Initialization of pseudo-random numnber generator
+```{r}
+seed <- 49563
+set.seed(seed)
+```
+
+
+#### [9.2] Optimal embedding dimension
+Find the optimal embedding dimension, based on univariate simplex projection
+```{r warning = FALSE}
+Emax <- 5 # equal to or smaller than the number of nodes (dimension of the ODE system)
+cri <- 'rmse' # model selection 
+Ed <- NULL
+forecast_skill_simplex <- NULL
+for(i in 1:ncol(ds)){
+  spx.i <- simplex(ds[, i], E = 2:Emax)
+  Ed <- c(Ed, spx.i[which.min(spx.i[, cri])[1], 'E'])
+  forecast_skill_simplex <- c(forecast_skill_simplex, spx.i[which.min(spx.i[, cri])[1], 'rho'])
+}
+Ed # The optimal embedding dimension for each variable
+```
+Optimal embedding dimension and forecasting skill
+```{r}
+Ed
+forecast_skill_simplex
+
+```
+#### [9.3] CCM analysis
+* Find causal variables by CCM analysis that will be used for multiview embedding.
+
+* Warning: It is time consuming for calculating the causation for each node
+
+* CCM causality test for all node pairs (the function was updated at 2024/05/07)
+```{r warning = FALSE}
+ccm.out <- ccm.fast.demo(ds, Epair = T, cri = cri, Emax = Emax)
+ccm.sig <- ccm.out[['ccm.sig']]
+ccm.rho <- ccm.out[['ccm.rho']]
+#To avoid overwrite the original files, we save them with different names,identified by date.
+DAY = Sys.Date()
+saveRDS(ccm.sig, paste('ccm_sig', da.name,'nin', nin, DAY, '.obj', sep = '_'))
+saveRDS(ccm.rho, paste('ccm_rho', da.name,'nin', nin, DAY, 'demo.obj', sep = '_'))
+```
+Just in case not conducting CCM but just loading the result of CCM at 2024/04/27
+```{r}
+DAY = "2024-04-27"
+#ccm.sig_old <- readRDS(paste('ccm_sig', da.name,'nin', nin, DAY, '.obj', sep = '_')) 
+#ccm.rho_old <- readRDS(paste('ccm_rho', da.name,'nin', nin, DAY, 'demo.obj', sep = '_'))
+```
+
+```{r}
+ccm.sig
+#ccm.sig_old
+ccm.rho
+#ccm.rho_old
+```
+#### [9.4] Multiview distance
+##### [9.4.1] Performing multiview analysis
+Based on the causal variables detected in CCM,
+
+(1) generates the time lag series (with maximum lag = 3),
+
+(2) conduct multivariate simplex projection and evaluate the forecast skill, and
+
+(3) selected the best kn(=100) SSR.
+
+Perform multiview embedding analysis for each node
+
+Warning: It is time consuming for running multiview embedding for each nodes
+```{r warning = FALSE}
+esele_lag <- esim.lag.demo(ds, ccm.rho, ccm.sig, Ed, kmax = 10000, kn = 100, max_lag = 3, Emax = Emax)
+# To avoid overwrite the original files, we save them with different names, 'XXX_NEW'.
+DAY = Sys.Date()
+saveRDS(esele_lag, paste('eseleLag', da.name, 'nin', nin, DAY, 'demo.obj', sep='_'))
+```
+The list of the selected best multivariate SSRs for each node (species, sp) with
+
+(1) the correlation coefficient (rho)
+
+(2) the list of variables (X_1, X_2, …) used in each SSR, noting that the number of variables is identical to the optimal embedding dimension obtained in [6.2], and
+
+(3) the list of time lags (vlag_1, vlag_2, …) used in the corresponding variables (X_1, X_2, …).
+```{r}
+as.data.frame(esele_lag)
+```
+##### [9.4.2] Compute multiview distance
+```{r}
+dmatrix.mv <- mvdist.demo(ds, ds.all, esele_lag)
+dmatrix.train.mvx <- dmatrix.mv[['dmatrix.train.mvx']]
+dmatrix.test.mvx <- dmatrix.mv[['dmatrix.test.mvx']]
+```
+Leave-one-out cross-validation for finding the optimal parameters for MDR S-map analysis
+
+–Warning: The cross-validation is the most time-consuming step in MDR S-map requiring massive computations and . Thus, we recommend dividing job into smaller parts (sub.da>1) or used parallel computation (parall=T, ncore>=1)
+```{r, warning = FALSE}
+do.MDR.CV <- T
+### The parameter cv.unit determines the precision of selected parameters and strongly influences computation time.
+### In our cases, we used cv.unit=0.025 to obtain more precise estimations
+### This parameter may be adjusted to 0.05 or even 0.1, depending on how sensitive the results to parameter precision. 
+cv.unit <- 0.025
+alpha.so <- seq(0, 1, cv.unit);            # Sequence of alpha
+sub.da <- 1                                # Divide the computation job into five parts 
+afsp <- eqsplit(1:length(alpha.so), sub.da) # Divide the parameter space based on alpha parameter
+alf <- 1                                   # Run CV in the first parameter subset 
+
+# Cross-validation of MDR analysis    
+if(do.MDR.CV){
+  alpha.s <- alpha.so[afsp[alf, 1]:afsp[alf, 2]] # Subset parameter space
+  cv.ind <- cv.MDR.demo(ds, ds_tp1, dmatrix.list = dmatrix.train.mvx, 
+                        parall = T, ncore = 24, keep_intra = T, alpha.seq = alpha.s)
+  # To avoid overwrite the original files, we save them with different names, 'XXX_NEW'.
+  saveRDS(cv.ind, paste(da.name, 'nin', nin, 'cvunit', cv.unit, 'alph', alpha.s[1]*100, DAY, 'cvout_Nmvx_Rallx.obj', sep = '_'))
+}
+```
+
+##### [9.4.3] Selecting the optimal parameters
+Select the optimal parameter set for regularized regression model with the minimal MSE
+
+```{r}
+paracv.demo <- secv.demo(cv.ind)
+paracv.demo
+```
+#### [9.5] MDR S-map
+Fitting MDR S-map based on the parameters selected by CV
+
+Note that the linear regression model in MDR S-map includes all of variables as X even if some of them were not selected as the causal variables at the step of using CCM. This is reasonable because S-map coefficients represent the effects of variables at short timescale while CCM evaluates the causality in the whole period of the time series. 
+```{r}
+#Setting
+do.MDR <- F
+cv.unit <- 0.025                           
+ptype <- 'aenet'          #enet:elastic-net or msaenet: adaptive elastic-net
+
+#Fitting the MDR S-map
+smap.5sp <- MDRsmap.demo(paracv = paracv.demo, ptype = ptype, keep_intra = T, out.sample = T,
+                            ds,ds_tp1,ds.test,dst_tp1,
+                            dmatrix.list = dmatrix.train.mvx,
+                            dmatrix.test.list = dmatrix.test.mvx)
+```
+
+In case for saving the results
+```{r}
+DAY = Sys.Date()
+nr.out <- smap.5sp[['nr.out']];
+
+  saveRDS(nr.out, paste(da.name,'_nin', nin, 'cvunit', cv.unit, ptype, DAY, 'nrout_Nmvx_Rallx_demo_NEW.obj',sep = '_'))
+    # Save interaction Jacobian matrices at all time points
+  saveRDS(smap.5sp[['jcof']], paste(da.name,'nin', nin, 'cvunit', cv.unit, ptype, DAY, '_jcof_Nmvx_Rallx_demo_NEW.obj', sep='_'))
+
+```
+
+S-map coefficients
+```{r}
+smap.5sp[['jcof']]
+#or
+#"5p_model_nin_198_cvunit_0.025_aenet_2024-07-19__jcof_Nmvx_Rallx_demo_NEW.obj"
+```
+
+### [10] Comparisons for 5sp model
+Loading data
+```{r}
+smap.5sp <- list()
+smap.5sp[['jcof']] <- readRDS("5p_model_nin_198_cvunit_0.025_aenet_2024-07-19__jcof_Nmvx_Rallx_demo_NEW.obj")
+smap.5sp[['jcof']]
+```
+
+#### [10.1] Compare standard S-map, MDR S-map, IIS, CIS
+CRIS (Eqn.21) and direct_IS (Eqn.19)
+```{r}
+#normalization by SD
+sd_adj_35 <- as.numeric(rk4_result.sd[5] / rk4_result.sd[3])
+
+CRIS_dC1dC1 <- precise_coeff_5sp[[1]][3,3] - 1.0
+direct_dC1dC1 <- direct_coeff_5sp[[1]][3,3] - 1.0
+CRIS_dC1dR <- sd_adj_35 * precise_coeff_5sp[[1]][3,5]
+direct_dC1dR <- sd_adj_35 * direct_coeff_5sp[[1]][3,5]
+for(j in 2:200) {
+  CRIS_dC1dC1 <- append(CRIS_dC1dC1, precise_coeff_5sp[[j]][3,3] - 1.0)
+  direct_dC1dC1 <- append(direct_dC1dC1, direct_coeff_5sp[[j]][3,3] - 1.0)
+  CRIS_dC1dR <- append(CRIS_dC1dR, sd_adj_35 * precise_coeff_5sp[[j]][3,5])
+  direct_dC1dR <- append(direct_dC1dR, sd_adj_35 * direct_coeff_5sp[[j]][3,5])
+}
+```
+
+
+Dataframe for basic plot
+```{r}
+final_ID <- 201
+tau <- 5.0
+food_chain_result <- data.frame(time = rk4_result$t[-final_ID], std_smapC1toC1 = rk4_m_smap_res2_s$smap_coefficients[[1]]$c_3[-final_ID] - 1.0, std_smapRtoC1 = rk4_m_smap_res2_s$smap_coefficients[[1]]$c_5[-final_ID], mdr_smapC1toC1 = subset(smap.5sp[['jcof']], variable == j_C1)[1:200, 7] - 1.0, mdr_smapRtoC1 = subset(smap.5sp[['jcof']], variable == j_C1)[1:200, 9], IIS_dC1dC1 = tau*dC1dC1(rk4_result)[-final_ID], IIS_dC1dR = tau*dC1dR(rk4_result)[-final_ID], CRIS_dC1dC1, CRIS_dC1dR, direct_dC1dC1, direct_dC1dR)
+
+food_chain_result
+```
+
+Dataframe for ggplot
+```{r}
+#For lineplots
+rk4_C1toC1_ggplot <- data.frame(
+  time = food_chain_result$time,
+  IntS = food_chain_result$std_smapC1toC1,
+  type = rep("01std_smapC1toC1", 200)
+)
+rk4_C1toC1_ggplot <- rbind.data.frame(
+  rk4_C1toC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$mdr_smapC1toC1,
+    type = rep("02mdr_smapC1toC1", 200)
+  )
+)
+rk4_C1toC1_ggplot <- rbind.data.frame(
+  rk4_C1toC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$CRIS_dC1dC1,
+    type = rep("03CRIS_dC1dC1", 200)
+  )
+)
+rk4_C1toC1_ggplot <- rbind.data.frame(
+  rk4_C1toC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$IIS_dC1dC1,
+    type = rep("04IIS_dC1dC1", 200)
+  )
+)                                  
+
+rk4_RtoC1_ggplot <- data.frame(
+  time = food_chain_result$time,
+  IntS = food_chain_result$std_smapRtoC1,
+  type = rep("01std_smapRtoC1", 200)
+)
+rk4_RtoC1_ggplot <- rbind.data.frame(
+  rk4_RtoC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$mdr_smapRtoC1,
+    type = rep("02mdr_smapRtoC1", 200)
+  )
+)
+rk4_RtoC1_ggplot <- rbind.data.frame(
+  rk4_RtoC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$CRIS_dC1dR,
+    type = rep("03CRIS_dC1dR", 200)
+  )
+)
+rk4_RtoC1_ggplot <- rbind.data.frame(
+  rk4_RtoC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$IIS_dC1dR,
+    type = rep("04IIS_dC1dR", 200)
+  )
+)
+
+#For error plots
+rk4_error_C1toC1_ggplot <- data.frame(
+  time = food_chain_result$time,
+  IntS = food_chain_result$std_smapC1toC1 - food_chain_result$direct_dC1dC1,
+  type = rep("01std_smapC1toC1", 200)
+)
+rk4_error_C1toC1_ggplot <- rbind.data.frame(
+  rk4_error_C1toC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$mdr_smapC1toC1 - food_chain_result$direct_dC1dC1,
+    type = rep("02mdr_smapC1toC1", 200)
+  )
+)
+rk4_error_C1toC1_ggplot <- rbind.data.frame(
+  rk4_error_C1toC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$CRIS_dC1dC1 - food_chain_result$direct_dC1dC1,
+    type = rep("03CRIS_dC1dC1", 200)
+  )
+)
+rk4_error_C1toC1_ggplot <- rbind.data.frame(
+  rk4_error_C1toC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$IIS_dC1dC1 - food_chain_result$direct_dC1dC1,
+    type = rep("04IIS_dC1dC1", 200)
+  )
+)
+
+rk4_error_RtoC1_ggplot <- data.frame(
+  time = food_chain_result$time,
+  IntS = food_chain_result$std_smapRtoC1 - food_chain_result$direct_dC1dR,
+  type = rep("01std_smapRtoC1", 200)
+)
+rk4_error_RtoC1_ggplot <- rbind.data.frame(
+  rk4_error_RtoC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$mdr_smapRtoC1 - food_chain_result$direct_dC1dR,
+    type = rep("02mdr_smapRtoC1", 200)
+  )
+)
+rk4_error_RtoC1_ggplot <- rbind.data.frame(
+  rk4_error_RtoC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$CRIS_dC1dR - food_chain_result$direct_dC1dR,
+    type = rep("03CRIS_dC1dR", 200)
+  )
+)
+rk4_error_RtoC1_ggplot <- rbind.data.frame(
+  rk4_error_RtoC1_ggplot, data.frame(
+    time = food_chain_result$time,
+    IntS = food_chain_result$IIS_dC1dR - food_chain_result$direct_dC1dR,
+    type = rep("04IIS_dC1dR", 200)
+  )
+)
+
+
+```
+
+##### [10.1.1] Comparison for the diagonal element (Fig. 3a: C1 -> C1): basic plot
+```{r}
+plot(food_chain_result$time, food_chain_result$CRIS_dC1dC1, type = "l", col = "#f6aa00", xlim = c(1400, 1800), ylim = c(-3, 2.0), xlab = "time", ylab = "Smap coefficient: C1 -> C1")
+par(new = T)
+plot(food_chain_result$time, food_chain_result$std_smapC1toC1, type = "l", col = "#ff4b00", xlim = c(1400, 1800), ylim = c(-3, 2.0), xlab = "", ylab = "")
+par(new = T)
+plot(food_chain_result$time, food_chain_result$mdr_smapC1toC1, type = "l", col = "#4dc4ff", xlim = c(1400, 1800), ylim = c(-3, 2.0), xlab = "", ylab = "")
+par(new = T)
+plot(food_chain_result$time, food_chain_result$IIS_dC1dC1, type = "l", lty = "dashed", col = "#804000", xlim = c(1400, 1800), ylim = c(-3, 2.0), xlab = "", ylab = "")
+```
+##### [10.1.2] Comparison for the diagonal element (Fig. 3ab: C1 -> C1): ggplot
+
+```{r warning = FALSE}
+fig3a_ggplot <- ggplot(data = rk4_C1toC1_ggplot) +
+  scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00", "#804000")) +
+  scale_shape_manual(values = c(15, 16, 17, 5)) +
+　geom_line(aes(x = time, y = IntS, group = type, color = type)) +
+  geom_point(aes(x = time, y = IntS, color = type, shape = type), size = 2) +
+  xlim(1400, 1800) + theme_bw() + theme(legend.position = "bottom") +
+  labs(title = "Time evolution: C1 -> C1", x = "time", y = "C1 -> C1") 
+
+fig3b_ggplot <- ggplot(rk4_error_C1toC1_ggplot, aes(type, abs(IntS))) +
+    scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00", "#804000")) +
+    scale_shape_manual(values = c(15, 16, 17, 5)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(shape = type, color = type, alpha = 0.1), width = 0.25, size = 3) +
+    theme_bw() + theme(legend.position = "bottom") +
+    labs (title = "Comparison to direct_evaluation: C1 -> C1") 
+
+plot(fig3a_ggplot)
+ggsave("fig3a.pdf", width = 6, height = 4)
+plot(fig3b_ggplot)
+ggsave("fig3b.pdf", width = 4, height = 4)
+```
+Difference between directly-evaluated CIS and CIS by linearized ODE
+```{r}
+summary(abs(food_chain_result$CRIS_dC1dC1 - food_chain_result$direct_dC1dC1))
+```
+
+
+##### [10.1.3] Comparison for the diagonal element (Fig. 3cd: R -> C1): ggplot
+
+```{r warning = FALSE}
+fig3c_ggplot <- ggplot(data = rk4_RtoC1_ggplot) +
+  scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00", "#804000")) +
+  scale_shape_manual(values = c(15, 16, 17, 5)) +
+　geom_line(aes(x = time, y = IntS, group = type, color = type)) +
+  geom_point(aes(x = time, y = IntS, color = type, shape = type), size = 2) +
+  xlim(1400, 1800) + theme_bw() + theme(legend.position = "bottom") +
+  labs(title = "Time evolution: R -> C1", x = "time", y = "R -> C1") 
+
+fig3d_ggplot <- ggplot(rk4_error_RtoC1_ggplot, aes(type, abs(IntS))) +
+    scale_colour_manual(values = c("#ff4b00", "#4dc4ff", "#f6aa00", "#804000")) +
+    scale_shape_manual(values = c(15, 16, 17, 5)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(shape = type, color = type, alpha = 0.1), width = 0.25, size = 3) +
+    theme_bw() + theme(legend.position = "bottom") +
+    labs (title = "Comparison to direct_evaluation: R -> C1") 
+
+plot(fig3c_ggplot)
+ggsave("fig3c.pdf", width = 6, height = 4)
+plot(fig3d_ggplot)
+ggsave("fig3d.pdf", width = 4, height = 4)
+```
+Difference between directly-evaluated CIS and CIS by linearized ODE
+```{r}
+summary(abs(food_chain_result$CRIS_dC1dR - food_chain_result$direct_dC1dR))
+```
+
+##### [10.1.4] Comparison for both diagonal and off-diagonal by correlation/regression
+```{r}
+#for diagonal element (C1 -> C1)
+plot(food_chain_result$std_smapC1toC1 ~ food_chain_result$direct_dC1dC1, 
+     xlab = "direct evaluation (C1 -> C1)",
+     ylab = "standard S-map coefficient (C1 -> C1)",
+     )
+abline(coef = c(0,1))
+
+cor(food_chain_result$std_smapC1toC1[-200], food_chain_result$direct_dC1dC1[-200])
+#Y should be the theoretical coefficient
+summary(lm(food_chain_result$direct_dC1dC1[-200] ~ food_chain_result$std_smapC1toC1[-200]))
+
+plot(food_chain_result$mdr_smapC1toC1 ~ food_chain_result$direct_dC1dC1, 
+     xlab = "direct evaluation (C1 -> C1)",
+     ylab = "MDR S-map coefficient (C1 -> C1)",
+     )
+abline(coef = c(0,1))
+
+cor(food_chain_result$mdr_smapC1toC1[-200], food_chain_result$direct_dC1dC1[-200])
+#Y should be the theoretical coefficient
+summary(lm(food_chain_result$direct_dC1dC1[-200] ~ food_chain_result$mdr_smapC1toC1[-200]))
+
+plot(food_chain_result$IIS_dC1dC1 ~ food_chain_result$direct_dC1dC1, 
+     xlab = "direct evaluation (C1 -> C1)",
+     ylab = "instantaneous interaction strength (C1 -> C1)",
+     )
+abline(coef = c(0,1))
+
+cor(food_chain_result$IIS_dC1dC1[-200], food_chain_result$direct_dC1dC1[-200])
+#Y should be the theoretical coefficient
+summary(lm(food_chain_result$direct_dC1dC1[-200] ~ food_chain_result$IIS_dC1dC1[-200]))
+
+
+#for off-diagonal element (R -> C1)
+plot(food_chain_result$std_smapRtoC1 ~ food_chain_result$direct_dC1dR, 
+     xlab = "direct evaluation (R -> C1)",
+     ylab = "standard S-map coefficient (R -> C1)",
+     )
+abline(coef = c(0,1))
+
+cor(food_chain_result$std_smapRtoC1[-200], food_chain_result$direct_dC1dR[-200])
+#Y should be the theoretical coefficient
+summary(lm(food_chain_result$direct_dC1dR[-200] ~ food_chain_result$std_smapRtoC1[-200]))
+
+plot(food_chain_result$mdr_smapRtoC1 ~ food_chain_result$direct_dC1dR, 
+     xlab = "direct evaluation (R -> C1)",
+     ylab = "MDR S-map coefficient (R -> C1)",
+     )
+abline(coef = c(0,1))
+
+cor(food_chain_result$mdr_smapRtoC1[-200], food_chain_result$direct_dC1dR[-200])
+#Y should be the theoretical coefficient
+summary(lm(food_chain_result$direct_dC1dR[-200] ~ food_chain_result$mdr_smapRtoC1[-200]))
+
+plot(food_chain_result$IIS_dC1dR ~ food_chain_result$direct_dC1dR, 
+     xlab = "direct evaluation (R -> C1)",
+     ylab = "instantaneous interaction strength (R -> C1)",
+     )
+abline(coef = c(0,1))
+
+cor(food_chain_result$IIS_dC1dR[-200], food_chain_result$direct_dC1dR[-200])
+#Y should be the theoretical coefficient
+summary(lm(food_chain_result$direct_dC1dR[-200] ~ food_chain_result$IIS_dC1dR[-200]))
+
+```
+
+
+#### [10.2] Compare Instantaneous Jacobian and CIS
+
+Note that: 
+
+1) Precise coeff with very short interval (deltat = 0.01) is identical to instantaneous Jacobian
+
+##### [10.2.1] For each graph independently 
+```{r}
+delta_33 <- 1 
+precise_data <- data.frame(t = rk4_result$t[1], precise_dC1dC1 = precise_coeff_5sp[[1]][3,3] - delta_33, inst_precise_dC1dC1 = inst_precise_coeff_5sp[[1]][3,3] - delta_33, tau0.5_precise_dC1dC1 = tau0.5_precise_coeff_5sp[[1]][3,3] - delta_33, tau1.0_precise_dC1dC1 = tau1.0_precise_coeff_5sp[[1]][3,3] - delta_33, tau2.0_precise_dC1dC1 = tau2.0_precise_coeff_5sp[[1]][3,3] - delta_33, tau10.0_precise_dC1dC1 = tau10.0_precise_coeff_5sp[[1]][3,3] - delta_33)
+for(j in 2:200) precise_data <- rbind.data.frame(precise_data, c(rk4_result$t[j], precise_coeff_5sp[[j]][3,3] - delta_33, inst_precise_coeff_5sp[[j]][3,3] - delta_33, tau0.5_precise_coeff_5sp[[j]][3,3] - delta_33, tau1.0_precise_coeff_5sp[[j]][3,3] - delta_33, tau2.0_precise_coeff_5sp[[j]][3,3] - delta_33, tau10.0_precise_coeff_5sp[[j]][3,3] - delta_33))
+
+plot(rk4_result$t[101:181], tau2*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-0.005, 0.005), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 0.01", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$inst_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-0.005, 0.005), xlab = "", ylab = "")
+
+legend("bottomright", 
+          legend = c("instantaneous interaction strength", "cumulative interaction strength"),  
+          col = c("black", "#ff4b00"), 
+          lty = c(1, 2),              
+          cex = c(0.8)
+)
+
+plot(rk4_result$t[101:181], tau3*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-0.4, 0.3), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 0.5", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau0.5_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-0.4, 0.3), xlab = "", ylab = "")
+
+
+
+plot(rk4_result$t[101:181], tau4*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(0.0, 0.15), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 1.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau1.0_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(0.0, 0.15), xlab = "", ylab = "")
+
+
+plot(rk4_result$t[101:181], tau5*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-0.4, 0.3), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 2.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau2.0_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-0.4, 0.3), xlab = "", ylab = "")
+
+
+plot(rk4_result$t[101:181], tau1*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-2, 2), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 5.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-2, 2), xlab = "", ylab = "")
+
+
+plot(rk4_result$t[101:181], tau6*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-2, 3), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 10.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau10.0_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-2, 3), xlab = "", ylab = "")
+
+```
+##### [10.2.2] For each graph as pdf for figure 4
+```{r}
+pdf("fig4a.pdf", width = 4, height = 4)
+plot(rk4_result$t[101:181], tau2*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-0.005, 0.005), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 0.01", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$inst_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-0.005, 0.005), xlab = "", ylab = "")
+
+legend("bottomright", 
+          legend = c("instantaneous interaction strength", "cumulative interaction strength"),  
+          col = c("black", "#ff4b00"), 
+          lty = c(1, 2),              
+          cex = c(0.8)
+)
+dev.off()
+
+pdf("fig4b.pdf", width = 4, height = 4)
+plot(rk4_result$t[101:181], tau3*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-0.4, 0.3), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 0.5", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau0.5_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-0.4, 0.3), xlab = "", ylab = "")
+dev.off()
+
+pdf("fig4c.pdf", width = 4, height = 4)
+plot(rk4_result$t[101:181], tau4*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(0.0, 0.15), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 1.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau1.0_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(0.0, 0.15), xlab = "", ylab = "")
+dev.off()
+
+pdf("fig4d.pdf", width = 4, height = 4)
+plot(rk4_result$t[101:181], tau5*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-0.4, 0.3), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 2.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau2.0_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-0.4, 0.3), xlab = "", ylab = "")
+dev.off()
+
+pdf("fig4e.pdf", width = 4, height = 4)
+plot(rk4_result$t[101:181], tau1*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-2, 2), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 5.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-2, 2), xlab = "", ylab = "")
+dev.off()
+
+pdf("fig4f.pdf", width = 4, height = 4)
+plot(rk4_result$t[101:181], tau6*dC1dC1(rk4_result)[101:181], type = "l", col = "black", ylim = c(-2, 3), xlab = "time", ylab = "Interaction strengths C1 -> C1", lwd = 1, main = expression(paste(tau, "= 10.0", sep="")))
+par(new = T)
+plot(rk4_result$t[101:181], precise_data$tau10.0_precise_dC1dC1[101:181], type = "l", col = "#ff4b00", lwd = 2, lty = 2, ylim = c(-2, 3), xlab = "", ylab = "")
+dev.off()
+```
+
+
+
+
